@@ -41,6 +41,7 @@
 // CHECK-NOT: _ExpressibleByImageLiteral
 
 // CHECK-SUGAR: extension Array :
+// CHECK-SUGAR: extension ImplicitlyUnwrappedOptional :
 // CHECK-SUGAR: extension Optional :
 
 // CHECK-MUTATING-ATTR: mutating func
