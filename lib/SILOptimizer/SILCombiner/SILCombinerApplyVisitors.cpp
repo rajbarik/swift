@@ -1644,6 +1644,8 @@ SILInstruction *SILCombiner::visitTryApplyInst(TryApplyInst *AI) {
   if (isa<FunctionRefInst>(AI->getCallee())) {
     if (propagateConcreteTypeOfInitExistential(AI)) {
       return nullptr;
+    } else if (propagateConcreteTypeOfInitExistentialToAllApplyArgs(AI)) {
+      return nullptr;
     }
   }
 
