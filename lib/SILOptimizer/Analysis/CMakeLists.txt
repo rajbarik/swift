@@ -18,6 +18,7 @@ set(ANALYSIS_SOURCES
   Analysis/LoopAnalysis.cpp
   Analysis/LoopRegionAnalysis.cpp
   Analysis/MemoryBehavior.cpp
+  Analysis/ProtocolDevirtualizerAnalysis.cpp
   Analysis/RCIdentityAnalysis.cpp
   Analysis/SideEffectAnalysis.cpp
   Analysis/SimplifyInstruction.cpp
