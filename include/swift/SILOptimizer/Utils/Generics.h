@@ -20,7 +20,10 @@
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SILOptimizer/Analysis/ProtocolDevirtualizerAnalysis.h"
+#include "swift/SILOptimizer/Utils/FunctionSignatureOptUtils.h"
 #include "swift/SILOptimizer/Utils/Local.h"
+#include "swift/SILOptimizer/Utils/SpecializationMangler.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -296,6 +299,61 @@ public:
 
   StringRef getClonedName() {
     return ClonedName;
+  }
+};
+
+/// ProtocolDevirtualizer transformation class that creates a protocol 
+/// constrained generic and a thunk.
+class ProtocolDevirtualizerTransform {
+  /// The original function to analyze and transform.
+  SILFunction *F;
+
+  /// The newly created inner function.
+  SILFunction *NewF;
+
+  /// The function signature mangler we are using.
+  Mangle::FunctionSignatureSpecializationMangler &Mangler;
+
+  /// Map Arguments to their ProtocolTypes.
+  llvm::SmallDenseMap<int, std::pair<ProtocolDecl *, ClassDecl *>> &Arg2DeclMap;
+
+  /// Argument to Generic Type Map for NewF.
+  llvm::SmallDenseMap<int, GenericTypeParamType *> Arg2GenericTypeMap;
+
+  // Allocate the argument descriptors.
+  llvm::SmallVector<ArgumentDescriptor, 4> &ArgumentDescList;
+
+  /// Create the Devirtualized Inner Function.
+  void createDevirtualizedProtocolFunction();
+
+  /// Create a name for the inner function.
+  std::string createDevirtualizedFunctionName();
+
+  /// Create the new devirtualized protocol function signature.
+  CanSILFunctionType createDevirtualizedFunctionType();
+
+  /// Populate the body of NewF.
+  void populateProtocolConstrainedGenericFunction(const SILDebugScope *DS);
+
+  /// Create the thunk.
+  void populateThunkBody();
+
+  public:
+  /// Constructor.
+  ProtocolDevirtualizerTransform(
+              SILFunction *F,
+              Mangle::FunctionSignatureSpecializationMangler &Mangler,
+              llvm::SmallVector<ArgumentDescriptor, 4> &ADL,
+              llvm::SmallDenseMap<int, std::pair<ProtocolDecl *, ClassDecl *>> &Arg2DeclMap
+            ) : F(F), NewF(nullptr), Mangler(Mangler), Arg2DeclMap(Arg2DeclMap) , ArgumentDescList(ADL) {}
+
+  /// Return the optimized iner function.
+  SILFunction *getDevirtualizedProtocolFunction() { return NewF; }
+
+  /// Run the optimization.
+  bool run() {
+    createDevirtualizedProtocolFunction();
+    return true;
   }
 };
 

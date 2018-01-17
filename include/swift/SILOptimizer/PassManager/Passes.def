@@ -150,6 +150,8 @@ PASS(DeadStoreElimination, "dead-store-elim",
      "Dead Store Elimination")
 PASS(GenericSpecializer, "generic-specializer",
      "Generic Function Specialization on Static Types")
+PASS(ProtocolDevirtualizer, "protocol-devirtualizer",
+     "Protocol Devirtualizer")
 PASS(GlobalOpt, "global-opt",
      "SIL Global Optimization")
 PASS(GlobalPropertyOpt, "global-property-opt",

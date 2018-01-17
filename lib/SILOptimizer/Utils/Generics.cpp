@@ -20,6 +20,7 @@
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/OptimizationRemark.h"
+#include "swift/SILOptimizer/Utils/CFG.h"
 #include "swift/SILOptimizer/Utils/GenericCloner.h"
 #include "swift/SILOptimizer/Utils/SpecializationMangler.h"
 #include "swift/Strings.h"
@@ -2609,4 +2610,362 @@ SILFunction *swift::lookupPrespecializedSymbol(SILModule &M,
 
   return Specialization;
 }
+/// Create a new function name for the newly generated protocol constrained generic function.
+std::string ProtocolDevirtualizerTransform::createDevirtualizedFunctionName(){
+  SILModule &M = F->getModule();
+  int UniqueID = 0;
+  std::string MangledName;
+  do {
+    MangledName = Mangler.mangle(UniqueID);
+    ++UniqueID;
+  } while (M.hasFunction(MangledName));
+  return MangledName;
+}
 
+
+/// Create the signature for the newly generated protocol constrained generic function.
+CanSILFunctionType ProtocolDevirtualizerTransform::createDevirtualizedFunctionType() {
+
+  CanSILFunctionType FTy = F->getLoweredFunctionType();
+  auto ExpectedFTy = F->getLoweredType().castTo<SILFunctionType>();
+  auto *Mod = F->getModule().getSwiftModule();
+  auto &Ctx = Mod->getASTContext();
+  GenericSignature *NewGenericSig;
+  GenericEnvironment *NewGenericEnv;
+
+  // Form a new generic signature based on the old one.
+  GenericSignatureBuilder Builder(Ctx);
+
+  /// If the original function is generic, then maintain the same.
+  /// Does it have generic structure already ?
+  auto HasGenericSignature = FTy->getGenericSignature() != nullptr;
+  if (HasGenericSignature) {
+    auto OrigGenericSig = FTy->getGenericSignature();
+    /// First, add the old generic signature.
+    Builder.addGenericSignature(OrigGenericSig);
+  }
+
+  /// Original list of parameters
+  SmallVector<SILParameterInfo, 4> params;
+  params.append(ExpectedFTy->getParameters().begin(),
+                ExpectedFTy->getParameters().end());
+
+  /// Convert the protocol arguments of F to generic ones.
+  for (auto &It : Arg2DeclMap) {
+    auto Idx = It.first;
+    auto ArgTypeTuple = It.second;
+    auto ArgType = ArgTypeTuple.first;
+
+    // Generate new generic parameter.
+    auto *NewGenericParam = GenericTypeParamType::get(0, Idx, Ctx);
+    Builder.addGenericParameter(NewGenericParam);
+    Requirement NewRequirement(RequirementKind::Conformance, NewGenericParam, ArgType->getDeclaredType());
+    auto Source = GenericSignatureBuilder::FloatingRequirementSource::forAbstract();
+    Builder.addRequirement(NewRequirement, Source, nullptr);
+    Arg2GenericTypeMap[Idx] = NewGenericParam;
+  }
+
+  /// Compute the generic signature.
+  NewGenericSig = std::move(Builder).computeGenericSignature(SourceLoc(), true);
+  NewGenericEnv = NewGenericSig->createGenericEnvironment();
+
+  /// Create a lambda for GenericParams.
+  auto getCanonicalType = [&](Type t) -> CanType {
+      return t->getCanonicalType(NewGenericSig);
+  };
+
+  /// Create the complete list of parameters.
+  int Idx = 0;
+  llvm::SmallVector<SILParameterInfo, 8> InterfaceParams;
+  InterfaceParams.reserve(params.size());
+  for (auto &param : params) {
+    if (Arg2GenericTypeMap[Idx]) {
+      auto GenericParam = Arg2GenericTypeMap[Idx];
+      if(param.getType().getAnyOptionalObjectType())
+        InterfaceParams.push_back( SILParameterInfo(OptionalType::get(getCanonicalType(GenericParam))->getCanonicalType(), param.getConvention()));
+      else InterfaceParams.push_back( SILParameterInfo(getCanonicalType(GenericParam), param.getConvention()));
+    } else {
+        auto paramIfaceTy = param.getType()->mapTypeOutOfContext();
+        InterfaceParams.push_back( SILParameterInfo(getCanonicalType(paramIfaceTy), param.getConvention()));
+    }
+    Idx++;
+  }
+
+  /// Now add the result type.
+  llvm::SmallVector<SILResultInfo, 8> InterfaceResults;
+  for (auto &result : ExpectedFTy->getResults()) {
+    auto resultIfaceTy = result.getType()->mapTypeOutOfContext();
+    auto InterfaceResult = result.getWithType(getCanonicalType(resultIfaceTy));
+    InterfaceResults.push_back(InterfaceResult);
+  }
+
+  /// Now add the errors.
+  Optional<SILResultInfo> InterfaceErrorResult;
+  if (ExpectedFTy->hasErrorResult()) {
+    auto errorResult = ExpectedFTy->getErrorResult();
+    auto errorIfaceTy = errorResult.getType()->mapTypeOutOfContext();
+    InterfaceErrorResult = SILResultInfo(
+        getCanonicalType(errorIfaceTy),
+          ExpectedFTy->getErrorResult().getConvention());
+  }
+
+  /// Now add the yields.
+  llvm::SmallVector<SILYieldInfo, 8> InterfaceYields;
+  for (SILYieldInfo InterfaceYield : FTy->getYields()) {
+    InterfaceYields.push_back(InterfaceYield);
+  }
+
+  /// Finally the ExtInfo.
+  auto ExtInfo = FTy->getExtInfo();
+  ExtInfo = ExtInfo.withRepresentation(SILFunctionTypeRepresentation::Thin);
+  auto witnessMethodConformance = FTy->getWitnessMethodConformanceOrNone();
+
+  /// Return the new signature.
+  return SILFunctionType::get(NewGenericSig, ExtInfo,
+                              FTy->getCoroutineKind(),
+                              FTy->getCalleeConvention(), InterfaceParams,
+                              InterfaceYields,
+                              InterfaceResults, InterfaceErrorResult,
+                              F->getModule().getASTContext(), witnessMethodConformance);
+}
+
+/// Determine the arguments for the new function.
+/// Copy the old body from F, but add a new init_existential_ref.
+/// to make the code compatible. Also rewrite the body.
+void ProtocolDevirtualizerTransform::populateProtocolConstrainedGenericFunction(const SILDebugScope *DebugScope) {
+
+  SILModule &M = F->getModule();
+  auto *Mod = F->getModule().getSwiftModule();
+  auto &Ctx = Mod->getASTContext();
+
+  /// The arguments to the branch instruction.
+  SmallVector<SILValue, 8> BranchArgs;
+
+  /// Create the entry basic block.
+  SILBasicBlock *NewFBody = NewF->createBasicBlock();
+
+  /// Builder to hold new instructions. It must have a ScopeClone with a debugscope
+  /// that is inherited from the F.
+  SILBuilder NewFBuilder(NewFBody);
+  NewFBuilder.setCurrentDebugScope(DebugScope);
+  SILOpenedArchetypesTracker OpenedArchetypesTrackerNewF(NewF);
+  NewFBuilder.setOpenedArchetypesTracker(&OpenedArchetypesTrackerNewF);
+  /// Determine the location for the new init_existential_ref.
+  auto InsertLoc = F->begin()->begin()->getLoc();
+  for (auto &ArgDesc : ArgumentDescList) {
+    /// For all Generic Arguments.
+    if(Arg2GenericTypeMap[ArgDesc.Index]) {
+      auto GenericParam=Arg2GenericTypeMap[ArgDesc.Index];
+      SILType GenericSILType = M.Types.getLoweredType(NewF->mapTypeIntoContext(GenericParam));
+      /// Create the new generic argument.
+      auto *NewArg = NewFBody->createFunctionArgument(GenericSILType);
+      auto Proto = Arg2DeclMap[ArgDesc.Index].first;
+      auto Conformance = Mod->lookupConformance(NewArg->getType().getSwiftRValueType(), Proto);
+      SmallVector<ProtocolConformanceRef, 1> NewConformances;
+      NewConformances.push_back(Conformance.getValue());
+      ArrayRef<ProtocolConformanceRef> Conformances = Ctx.AllocateCopy(NewConformances);
+      ///  Create an init_existential_ref.
+      /// %5 = init_existential_ref %0 : $T : $T, $ListenerProtocol
+      auto *InitRef = NewFBuilder.createInitExistentialRef( InsertLoc, ArgDesc.Arg->getType(),
+                  NewArg->getType().getSwiftRValueType()->getCanonicalType(), NewArg, Conformances);
+      BranchArgs.push_back(InitRef);
+    } else {
+      auto newArg = NewFBody->createFunctionArgument(ArgDesc.Arg->getType(), ArgDesc.Decl);
+      BranchArgs.push_back(newArg);
+    }
+  }
+
+  /// Then we splice the body of F to NewF after the first basic block.
+  auto It = NewF->begin();
+  It++;
+  NewF->getBlocks().splice(It, F->getBlocks());
+
+  /// Determine the old entry.
+  auto NewIt = NewF->begin();
+  NewIt++;
+  SILBasicBlock *OldEntryBB = &(*NewIt);
+
+  /// Create a fake branch instruction, which will be eliminated by the merge function below.
+  NewFBuilder.createBranch(InsertLoc, OldEntryBB, BranchArgs);
+
+  ///  Merge the first and second basic blocks since it is just a direct branch.
+  ///  This is ugly...
+  mergeBasicBlockWithSuccessor(&(*(NewF->begin())), nullptr, nullptr);
+}
+
+/// Create the Thunk Body with always_inline attribute.
+void ProtocolDevirtualizerTransform::populateThunkBody() {
+
+  SILModule &M = F->getModule();
+
+  F->setThunk(IsThunk);
+  F->setInlineStrategy(AlwaysInline);
+
+  /// Create a basic block and the function arguments.
+  SILBasicBlock *ThunkBody = F->createBasicBlock();
+  for (auto &ArgDesc : ArgumentDescList) {
+    ThunkBody->createFunctionArgument(ArgDesc.Arg->getType(), ArgDesc.Decl);
+  }
+
+  /// Builder to add new instructions in the Thunk.
+  SILBuilder Builder(ThunkBody);
+  SILOpenedArchetypesTracker OpenedArchetypesTracker(F);
+  Builder.setOpenedArchetypesTracker(&OpenedArchetypesTracker);
+  Builder.setCurrentDebugScope(ThunkBody->getParent()->getDebugScope());
+
+  /// Location to insert new instructions.
+  SILLocation Loc = ThunkBody->getParent()->getLocation();
+
+  /// Create the function_ref instruction to the NewF.
+  FunctionRefInst *FRI = Builder.createFunctionRef(Loc, NewF);
+
+  /// Determine arguments to Apply.
+  /// Generate opened existentials for generics.
+  llvm::SmallVector<SILValue, 8> ApplyArgs;
+  llvm::DenseMap<SubstitutableType *, Type> Generic2OpenedTypeMap;
+  for (auto &ArgDesc : ArgumentDescList) {
+    if(Arg2GenericTypeMap[ArgDesc.Index]) {
+      ArchetypeType *Opened;
+      SILValue OrigOperand = ThunkBody->getArgument(ArgDesc.Index);
+      auto SwiftType = ArgDesc.Arg->getType().getSwiftRValueType();
+      auto OpenedType = SwiftType->openAnyExistentialType(Opened)->getCanonicalType();
+      auto OpenedSILType = NewF->getModule().Types.getLoweredType(OpenedType);
+      SILValue archetypeValue = Builder.createOpenExistentialRef(Loc,
+                                       OrigOperand,
+                                       OpenedSILType
+                          );
+      ApplyArgs.push_back(archetypeValue);
+      auto GenericParam = Arg2GenericTypeMap[ArgDesc.Index];
+      Generic2OpenedTypeMap[GenericParam] = OpenedType;
+    } else {
+      ApplyArgs.push_back(ThunkBody->getArgument(ArgDesc.Index));
+    }
+  }
+ /// Create substitutions for Apply instructions. This is tricky!
+  SILValue ReturnValue;
+  SILType LoweredType = NewF->getLoweredType();
+  SILType ResultType = NewF->getConventions().getSILResultType();
+  auto GenCalleeType = NewF->getLoweredFunctionType();
+
+  // Handle cases where F is already a generic function.
+  ArrayRef<Substitution> CallerSubs = F->getForwardingSubstitutions();
+
+  SmallVector<Substitution, 8> Substitutions;
+  auto CalleeGenericSig = GenCalleeType->getGenericSignature();
+  auto SubMap = CalleeGenericSig->getSubstitutionMap(
+    [&](SubstitutableType *type) -> Type {
+        if(Generic2OpenedTypeMap[type]) {
+          return Generic2OpenedTypeMap[type];
+        }
+        return type;
+    },
+    LookUpConformanceInSignature(*CalleeGenericSig));
+
+  /// Get the substitutions.
+  CalleeGenericSig->getSubstitutions(SubMap, Substitutions);
+
+  /// Combine the two substitutions (original F's substitutions and now NewF).
+  Substitutions.reserve(Substitutions.size() + CallerSubs.size());
+  for(auto Sub: CallerSubs) {
+    Substitutions.push_back(Sub);
+  }
+
+  /// Perform the substitutions.
+  auto SubstCalleeType = GenCalleeType->substGenericArgs(M, Substitutions);
+
+  /// Obtain the Result Type.
+  SILFunctionConventions Conv(SubstCalleeType, M);
+  ResultType = Conv.getSILResultType();
+
+  auto FunctionTy = LoweredType.castTo<SILFunctionType>();
+
+  /// If the original function has error results,  we need to generate a
+  /// try_apply to call a function with an error result.
+  if (FunctionTy->hasErrorResult()) {
+    SILFunction *Thunk = ThunkBody->getParent();
+    SILBasicBlock *NormalBlock = Thunk->createBasicBlock();
+    ReturnValue =
+        NormalBlock->createPHIArgument(ResultType, ValueOwnershipKind::Owned);
+    SILBasicBlock *ErrorBlock = Thunk->createBasicBlock();
+    SILType Error =
+        SILType::getPrimitiveObjectType(FunctionTy->getErrorResult().getType());
+    auto *ErrorArg =
+        ErrorBlock->createPHIArgument(Error, ValueOwnershipKind::Owned);
+    Builder.createTryApply(Loc, FRI, Substitutions, ApplyArgs, NormalBlock, ErrorBlock);
+
+    Builder.setInsertionPoint(ErrorBlock);
+    Builder.createThrow(Loc, ErrorArg);
+    Builder.setInsertionPoint(NormalBlock);
+  } else {
+    /// Create the Apply with substitutions
+    ReturnValue = Builder.createApply(Loc, FRI, Substitutions, ApplyArgs, false);
+  }
+
+  /// Set up the return results.
+  if (NewF->isNoReturnFunction()) {
+    Builder.createUnreachable(Loc);
+  } else {
+    Builder.createReturn(Loc, ReturnValue);
+  }
+}
+
+/// Strategy to devirtualize protocol arguments:
+/// (1) Create a protocol constrained generic function from the old function;
+/// (2) Create a thunk for the original function that invokes (1) including setting
+///     its inline strategy as always inline.
+void ProtocolDevirtualizerTransform::createDevirtualizedProtocolFunction() {
+  SILModule &M = F->getModule();
+  std::string Name = createDevirtualizedFunctionName();
+  SILLinkage linkage = getSpecializedLinkage(F, F->getLinkage());
+
+  DEBUG(llvm::dbgs() << "  -> create devirtualized function for: " << Name << "\n");
+
+  /// Create devirtualized function type.
+  auto NewFTy = createDevirtualizedFunctionType();
+
+  auto NewFGenericSig = NewFTy->getGenericSignature();
+  auto NewFGenericEnv = NewFGenericSig->createGenericEnvironment();
+
+  /// Step 1: Create the new protocol constrained generic function.
+  NewF = M.createFunction(
+      linkage, Name, NewFTy, NewFGenericEnv, F->getLocation(), F->isBare(),
+      F->isTransparent(), F->isSerialized(), F->getEntryCount(), F->isThunk(),
+      F->getClassSubclassScope(), F->getInlineStrategy(), F->getEffectsKind(),
+      nullptr, F->getDebugScope());
+
+  /// Create a new debug scope.
+  ScopeCloner SC(*NewF);
+  auto DebugScope = SC.getOrCreateClonedScope(F->getDebugScope());
+
+  /// Populate the body of NewF.
+  populateProtocolConstrainedGenericFunction(DebugScope);
+
+  /// Set Unqualified ownership, if any.
+  if (!F->hasQualifiedOwnership()) {
+    NewF->setUnqualifiedOwnership();
+  }
+
+  // Transfer array attributes, if any.
+  for (auto &Attr : F->getSemanticsAttrs()) {
+    if (!StringRef(Attr).startswith("array."))
+      NewF->addSemanticsAttr(Attr);
+  }
+
+  // Update the ownership.
+  for (auto Arg : NewF->begin()->getFunctionArguments()) {
+    SILType MappedTy = Arg->getType();
+    auto Ownershipkind =
+        ValueOwnershipKind(M, MappedTy, Arg->getArgumentConvention());
+    Arg->setOwnershipKind(Ownershipkind);
+  }
+
+  /// Step 2: Create the thunk with always_inline.
+  populateThunkBody();
+
+  assert(F->getDebugScope()->Parent != NewF->getDebugScope()->Parent);
+
+  DEBUG(
+    F->dump();
+    NewF->dump();
+  );
+}

@@ -331,6 +331,9 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
 
   // Add the outliner pass (Osize).
   P.addOutliner();
+
+  // Protocol Devirtualizer Pass.
+  P.addProtocolDevirtualizer();
 }
 
 static void addHighLevelEarlyLoopOptPipeline(SILPassPipelinePlan &P) {
