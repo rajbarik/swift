@@ -241,10 +241,17 @@ bool ProtocolDevirtualizer::canDevirtualizeProtocolInFunction(ProtocolDevirtuali
           bool UnknownPattern = false;
           for (auto *Op : Args[i]->getUses()) {
             auto User = Op->getUser();
-            auto *Open = dyn_cast<OpenExistentialRefInst>(User);
-            auto *Debug = dyn_cast<DebugValueInst>(User);
-            if(!(Open || Debug)) {
-              UnknownPattern = true;
+            switch (User->getKind()) {
+              case SILInstructionKind::OpenExistentialAddrInst:
+              case SILInstructionKind::OpenExistentialBoxValueInst:
+              case SILInstructionKind::OpenExistentialMetatypeInst:
+              case SILInstructionKind::OpenExistentialValueInst:
+                UnknownPattern = true;
+                break;
+              default: break;
+            }
+            if(UnknownPattern) {
+              break;
             }
           }
           if (!UnknownPattern) {
