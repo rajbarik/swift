@@ -1165,7 +1165,7 @@ SILCombiner::propagateConcreteTypeOfInitExistentialToAllApplyArgs(FullApplySite 
   if (!AI.hasSubstitutions())
     return nullptr;
   auto *Callee = AI.getReferencedFunction();
-  if (!Callee)
+  if (!Callee || !Callee->shouldOptimize() || Callee->empty())
     return nullptr;
 
   auto FnTy = AI.getCallee()->getType().castTo<SILFunctionType>();
