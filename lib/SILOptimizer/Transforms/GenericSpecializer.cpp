@@ -238,10 +238,21 @@ bool ProtocolDevirtualizer::canDevirtualizeProtocolInFunction(ProtocolDevirtuali
         auto ProtoDecl = dyn_cast<ProtocolDecl>(SwiftProtoDecl);
         auto CD = PDA->getSoleClassImplementingProtocol(ProtoDecl);
         if (CD) {
-          /// Save the mapping for transformation pass.
-          Arg2DeclMap[i] = std::make_pair(ProtoDecl, CD);
-          DEBUG(llvm::dbgs() << "Function: " << F->getName() << " has a singel class decl\n");
-          returnFlag |= true;
+          bool UnknownPattern = false;
+          for (auto *Op : Args[i]->getUses()) {
+            auto User = Op->getUser();
+            auto *Open = dyn_cast<OpenExistentialRefInst>(User);
+            auto *Debug = dyn_cast<DebugValueInst>(User);
+            if(!(Open || Debug)) {
+              UnknownPattern = true;
+            }
+          }
+          if (!UnknownPattern) {
+            /// Save the mapping for transformation pass.
+            Arg2DeclMap[i] = std::make_pair(ProtoDecl, CD);
+            DEBUG(llvm::dbgs() << "Function: " << F->getName() << " has a singel class decl\n");
+            returnFlag |= true;
+          }
         }
       }
     }
