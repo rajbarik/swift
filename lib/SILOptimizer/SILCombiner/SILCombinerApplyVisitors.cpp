@@ -1158,6 +1158,140 @@ SILCombiner::propagateConcreteTypeOfInitExistential(FullApplySite AI) {
   return propagateConcreteTypeOfInitExistential(AI, PD, PropagateIntoOperand);
 }
 
+/// A peephole optimizer that propagates concrete types of all arguments to Apply.
+SILInstruction *
+SILCombiner::propagateConcreteTypeOfInitExistentialToAllApplyArgs(FullApplySite AI) {
+  /// Check if legal to perform propagation.
+  if (!AI.hasSubstitutions())
+    return nullptr;
+  auto *Callee = AI.getReferencedFunction();
+  if (!Callee)
+    return nullptr;
+
+  auto FnTy = AI.getCallee()->getType().castTo<SILFunctionType>();
+  if(!FnTy->isPolymorphic()) 
+    return nullptr;
+
+  /// Find a mapping from Archetype to the Protocol declaration.
+  ArrayRef<Substitution> CallerSubs = Callee->getForwardingSubstitutions();
+  llvm::DenseMap<Type, ProtocolDecl *> GenericType2ProtocolMap;
+  for(auto &sub : CallerSubs) {
+    auto ReplacementType = sub.getReplacement();
+    auto Conformances = sub.getConformances();
+    ArchetypeType * ArcheType;
+    if (ReplacementType->hasArchetype() && 
+      (ArcheType = ReplacementType->getAs<ArchetypeType>()) && 
+        (Conformances.size() == 1)) {
+      auto ProtoDecl = Conformances[0].getRequirement();
+      GenericType2ProtocolMap[ArcheType->getInterfaceType()] = ProtoDecl; 
+    }
+  }
+
+  auto Args = Callee->begin()->getFunctionArguments();
+  SmallVector<SILValue, 8> NewApplyArgs;
+  llvm::DenseMap<SubstitutableType *, Type> GenericType2ConcreteTypeMap;
+  llvm::DenseMap<Type, Optional<ProtocolConformanceRef>> ConcreteType2ConformanceMap;
+  bool MatchPattern = false;
+
+  /// We are looking for the following  pattern (can be extended in the future).
+  /// %0 = alloc_ref $SomeClass
+  /// %1 = init_existential_ref %0 : $SomeClass : $SomeClass, $SomeProtocol
+  /// %2 = function_ref @something_to_devirtualize : $@convention(thin) (@guaranteed SomeProtocol) -> Int
+  /// %3 = apply %2(%1) : $@convention(thin) (@guaranteed SomeProtocol) -> Int
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    auto ArgType = Args[i]->getType();
+    auto ArgASTType = ArgType.getSwiftRValueType();
+    auto OrigApplyArg = AI.getArgument(i);
+    ArchetypeType *ArcheType;
+    OpenExistentialRefInst *Open;
+    InitExistentialRefInst *IE;
+    /// Check all conditions for pattern matching.
+    if (ArgASTType->hasArchetype() && (ArcheType = ArgASTType->getAs<ArchetypeType>()) && 
+        (ArcheType->getInterfaceType()->is<GenericTypeParamType>()) && 
+        GenericType2ProtocolMap[ArcheType->getInterfaceType()] && 
+        (Open = dyn_cast<OpenExistentialRefInst>(OrigApplyArg)) &&  
+        (IE = dyn_cast<InitExistentialRefInst>(Open->getOperand()))
+      ) {
+      auto Protocol = GenericType2ProtocolMap[ArcheType->getInterfaceType()];
+      auto Conformances = IE->getConformances();
+      auto ConcreteType = IE->getFormalConcreteType();
+      auto NewApplyArg = IE->getOperand();
+      auto ExistentialType = IE->getType().getSwiftRValueType();
+      auto OpenedArchetype = Open->getType().castTo<ArchetypeType>();;
+      auto ExistentialSig = AI.getModule().getASTContext()
+                                  .getExistentialSignature(ExistentialType,
+                                   AI.getModule().getSwiftModule());
+
+      Substitution ConcreteSub(ConcreteType, Conformances);
+      auto SubMap = ExistentialSig->getSubstitutionMap({&ConcreteSub, 1});
+      auto Conformance = SubMap.lookupConformance(
+                  CanType(ExistentialSig->getGenericParams()[0]), Protocol);
+      /// Store the concrete type and the conformance.
+      GenericType2ConcreteTypeMap[OpenedArchetype] = ConcreteType;
+      ConcreteType2ConformanceMap[ConcreteType] = Conformance;
+      NewApplyArgs.push_back(NewApplyArg);
+      MatchPattern = true;
+    } else {
+      NewApplyArgs.push_back(OrigApplyArg);
+    }
+  }
+  /// Bail if we did not find a pattern.
+  if (!MatchPattern)  {
+    return nullptr;
+  }
+
+  /// Create the substition map for Apply. Boilerplate code.
+  SmallVector<Substitution, 8> Substitutions;
+  SILType NewSubstCalleeType;
+  auto FnSubsMap =
+    FnTy->getGenericSignature()->getSubstitutionMap(AI.getSubstitutions());
+  auto FinalSubsMap = FnSubsMap.subst(
+      [&](SubstitutableType *type) -> Type {
+        if (GenericType2ConcreteTypeMap[type])
+          return GenericType2ConcreteTypeMap[type];
+        return type;
+      },
+      [&](CanType origTy, Type substTy,
+        ProtocolType *proto) -> Optional<ProtocolConformanceRef> {
+        if (ConcreteType2ConformanceMap[substTy]) {
+          auto Conformance = ConcreteType2ConformanceMap[substTy];
+          assert(proto->getDecl() == Conformance->getRequirement());
+          return Conformance;
+        }
+        return ProtocolConformanceRef(proto->getDecl());
+  });
+  FnTy->getGenericSignature()->getSubstitutions(FinalSubsMap, Substitutions);
+  CanSILFunctionType SFT = FnTy->substGenericArgs(
+                               AI.getModule(),
+                               Substitutions);
+  NewSubstCalleeType = SILType::getPrimitiveObjectType(SFT);
+
+  /// Create a new ApplySite
+  FullApplySite NewAI;
+
+  /// Setup the builder.
+  Builder.setCurrentDebugScope(AI.getDebugScope());
+  Builder.addOpenedArchetypeOperands(AI.getInstruction());
+
+  /// Create the new Apply Instruction with concrete types
+  if (auto *TAI = dyn_cast<TryApplyInst>(AI))
+    NewAI = Builder.createTryApply(AI.getLoc(), AI.getCallee(), Substitutions,
+                                   NewApplyArgs, TAI->getNormalBB(), TAI->getErrorBB());
+  else
+    NewAI = Builder.createApply(AI.getLoc(), AI.getCallee(), Substitutions,
+                                NewApplyArgs, cast<ApplyInst>(AI)->isNonThrowing());
+
+  /// Rewrite the uses of Apply based on the new one.
+  if (auto apply = dyn_cast<ApplyInst>(NewAI))
+    replaceInstUsesWith(*cast<ApplyInst>(AI.getInstruction()), apply);
+
+  /// Delete the Apply Site.
+  eraseInstFromFunction(*AI.getInstruction());
+
+  return NewAI.getInstruction();
+}
+
+
 /// \brief Check that all users of the apply are retain/release ignoring one
 /// user.
 static bool
@@ -1386,6 +1520,8 @@ SILInstruction *SILCombiner::visitApplyInst(ApplyInst *AI) {
   // init_existential_ref.
   if (isa<FunctionRefInst>(AI->getCallee())) {
     if (propagateConcreteTypeOfInitExistential(AI)) {
+      return nullptr;
+    } else if (propagateConcreteTypeOfInitExistentialToAllApplyArgs(AI)) {
       return nullptr;
     }
   }

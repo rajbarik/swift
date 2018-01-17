@@ -295,6 +295,9 @@ private:
                                                          WitnessMethodInst *WMI);
   SILInstruction *propagateConcreteTypeOfInitExistential(FullApplySite AI);
 
+  /// Propagate concrete types to all apply arguments.
+  SILInstruction *propagateConcreteTypeOfInitExistentialToAllApplyArgs(FullApplySite AI);
+
   /// Perform one SILCombine iteration.
   bool doOneIteration(SILFunction &F, unsigned Iteration);
 
