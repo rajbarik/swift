@@ -568,8 +568,8 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
       return true;
     }
   }
-  if (Args.hasArg(OPT_sil_protocol_devirtualizer)) {
-    Opts.ProtocolDevirtualizer = true;
+  if (Args.hasArg(OPT_sil_existential_specializer)) {
+    Opts.ExistentialSpecializer = true;
   }
   if (const Arg *A = Args.getLastArg(OPT_num_threads)) {
     if (StringRef(A->getValue()).getAsInteger(10, Opts.NumThreads)) {

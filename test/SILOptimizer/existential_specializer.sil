@@ -1,0 +1,304 @@
+// RUN: %target-sil-opt -wmo -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all %s -existential-specializer -inline -sil-combine -generic-specializer  -allocbox-to-stack -copy-forwarding -lower-aggregate-instrs -mem2reg -devirtualizer -late-inline -dead-arg-signature-opt -dce -sil-deadfuncelim | %FileCheck %s
+//
+import Builtin
+import Swift
+
+// Class protocol test.
+internal protocol SomeProtocol : AnyObject {
+  func foo() -> Int
+}
+
+internal class SomeClass : SomeProtocol {
+  init()
+  func foo() -> Int
+}
+
+/// Class protocol composition test.
+internal protocol SomeClassProtocolComp : class {
+  func foo_cpc() -> Int
+}
+internal protocol SomeOtherClassProtocolComp : class {
+  func bar_cpc() -> Int
+}
+internal class SomeClassComp : SomeClassProtocolComp, SomeOtherClassProtocolComp{
+  init()
+  func foo_cpc() -> Int
+  func bar_cpc() -> Int
+}
+
+// Non-class protocol test.
+internal protocol SomeNoClassProtocol {
+  func foo_ncp() -> Int
+}
+internal class SomeNoClass : SomeNoClassProtocol{
+  init()
+  func foo_ncp() -> Int
+}
+
+// Non class protocol composition test.
+internal protocol SomeNoClassProtocolComp  {
+  func foo_ncpc()  -> Int
+}
+internal protocol SomeOtherNoClassProtocolComp  {
+  func bar_ncpc()  -> Int
+}
+internal class SomeNoClassComp: SomeNoClassProtocolComp, SomeOtherNoClassProtocolComp {
+  init()
+  func foo_ncpc() -> Int
+  func bar_ncpc() -> Int 
+}
+
+sil private [transparent] [thunk] @foo : $@convention(witness_method: SomeProtocol) (@guaranteed SomeClass) -> Int {
+bb0(%0 : $SomeClass):
+  %1 = integer_literal $Builtin.Int64, 10 
+  %2 = struct $Int (%1 : $Builtin.Int64) 
+  return %2 : $Int 
+} 
+sil private [transparent] [thunk] @foo_cpc : $@convention(witness_method: SomeClassProtocolComp) (@guaranteed SomeClassComp) -> Int {
+bb0(%0 : $SomeClassComp):
+  %1 = integer_literal $Builtin.Int64, 10 
+  %2 = struct $Int (%1 : $Builtin.Int64) 
+  return %2 : $Int 
+} 
+sil private [transparent] [thunk] @bar_cpc : $@convention(witness_method: SomeOtherClassProtocolComp) (@guaranteed SomeClassComp) -> Int {
+bb0(%0 : $SomeClassComp):
+  %1 = integer_literal $Builtin.Int64, 20 
+  %2 = struct $Int (%1 : $Builtin.Int64) 
+  return %2 : $Int 
+} 
+sil hidden [thunk] [always_inline] @foo_ncp_ : $@convention(witness_method:SomeNoClassProtocol) (@in_guaranteed SomeNoClass) -> Int {
+bb0(%0 : $*SomeNoClass):
+  %1 = load %0 : $*SomeNoClass 
+  %2 = class_method %1 : $SomeNoClass, #SomeNoClass.foo_ncp!1 : (SomeNoClass) -> () -> Int, $@convention(method) (@guaranteed SomeNoClass) -> Int
+  %3 = apply %2(%1) : $@convention(method) (@guaranteed SomeNoClass) -> Int 
+  return %3 : $Int
+}
+sil hidden [thunk] [always_inline] @foo_ncp : $@convention(method) (@guaranteed SomeNoClass) -> Int {
+bb0(%0: $SomeNoClass):
+  %1 = integer_literal $Builtin.Int64, 10 
+  %2 = struct $Int (%1 : $Builtin.Int64) 
+  return %2 : $Int 
+} 
+sil hidden [thunk] [always_inline] @foo_ncpc_ : $@convention(witness_method:SomeNoClassProtocolComp) (@in_guaranteed SomeNoClassComp) -> Int {
+bb0(%0 : $*SomeNoClassComp):
+  %1 = load %0 : $*SomeNoClassComp 
+  %2 = class_method %1 : $SomeNoClassComp, #SomeNoClassComp.foo_ncpc!1 : (SomeNoClassComp) -> () -> Int, $@convention(method) (@guaranteed SomeNoClassComp) -> Int
+  %3 = apply %2(%1) : $@convention(method) (@guaranteed SomeNoClassComp) -> Int 
+  return %3 : $Int
+}
+sil hidden [thunk] [always_inline] @foo_ncpc : $@convention(method) (@guaranteed SomeNoClassComp) -> Int {
+bb0(%0: $SomeNoClassComp):
+  %1 = integer_literal $Builtin.Int64, 10 
+  %2 = struct $Int (%1 : $Builtin.Int64) 
+  return %2 : $Int 
+} 
+sil hidden [thunk] [always_inline] @bar_ncpc_ : $@convention(witness_method:SomeOtherNoClassProtocolComp) (@in_guaranteed SomeNoClassComp) -> Int {
+bb0(%0 : $*SomeNoClassComp):
+  %1 = load %0 : $*SomeNoClassComp 
+  %2 = class_method %1 : $SomeNoClassComp, #SomeNoClassComp.bar_ncpc!1 : (SomeNoClassComp) -> () -> Int, $@convention(method) (@guaranteed SomeNoClassComp) -> Int
+  %3 = apply %2(%1) : $@convention(method) (@guaranteed SomeNoClassComp) -> Int 
+  return %3 : $Int
+}
+sil hidden [thunk] [always_inline] @bar_ncpc : $@convention(method) (@guaranteed SomeNoClassComp) -> Int {
+bb0(%0: $SomeNoClassComp):
+  %1 = integer_literal $Builtin.Int64, 20 
+  %2 = struct $Int (%1 : $Builtin.Int64) 
+  return %2 : $Int 
+} 
+
+// CHECK-LABEL: sil @something_cp :
+// CHECK: bb0
+// CHECK: alloc_ref
+// CHECK-NOT: init_existential_ref
+// CHECK: function_ref 
+// CHECK: apply
+// CHECK: return
+sil @something_cp : $@convention(thin) () -> Int {
+bb0:
+  %0 = alloc_ref $SomeClass
+  %1 = init_existential_ref %0 : $SomeClass : $SomeClass, $SomeProtocol
+  %2 = function_ref @something_to_specialize_cp : $@convention(thin) (@guaranteed SomeProtocol) -> Int
+  %3 = apply %2(%1) : $@convention(thin) (@guaranteed SomeProtocol) -> Int
+  return %3 : $Int
+} 
+
+// CHECK-LABEL: sil @something_cpc :
+// CHECK: bb0
+// CHECK: alloc_ref
+// CHECK-NOT: init_existential_ref
+// CHECK: function_ref
+// CHECK: apply
+// CHECK: return
+sil @something_cpc : $@convention(thin) () -> Int {
+bb0:
+  %0 = alloc_ref $SomeClassComp
+  %1 = init_existential_ref %0 : $SomeClassComp: $SomeClassComp, $SomeClassProtocolComp & SomeOtherClassProtocolComp 
+  %2 = function_ref @something_to_specialize_cpc : $@convention(thin) (@owned SomeClassProtocolComp & SomeOtherClassProtocolComp) -> Int
+  %3 = apply %2(%1) : $@convention(thin) (@owned SomeClassProtocolComp & SomeOtherClassProtocolComp) -> Int
+  return %3 : $Int
+} 
+
+// CHECK-LABEL: sil @something_ncp :
+// CHECK: bb0
+// CHECK: alloc_ref
+// CHECK-NOT: init_existential_addr
+// CHECK-NOT: alloc_stack
+// CHECK-NOT: dealloc_stack
+// CHECK: function_ref
+// CHECK: apply
+// CHECK: return
+sil @something_ncp : $@convention(thin) () -> Int {
+bb0:
+  %1 = alloc_stack $SomeNoClassProtocol
+  %2 = init_existential_addr %1 : $*SomeNoClassProtocol, $SomeNoClass
+  %3 = alloc_ref $SomeNoClass
+  store %3 to %2 : $*SomeNoClass 
+  %4 = alloc_stack $SomeNoClassProtocol
+  copy_addr %1 to [initialization] %4 : $*SomeNoClassProtocol
+  %5 = function_ref @something_to_specialize_ncp : $@convention(thin) (@in SomeNoClassProtocol) -> Int
+  %6 = apply %5(%4) : $@convention(thin) (@in SomeNoClassProtocol) -> Int
+  dealloc_stack %4 : $*SomeNoClassProtocol
+  dealloc_stack %1 : $*SomeNoClassProtocol
+  return %6 : $Int
+} 
+
+// CHECK-LABEL: sil @something_ncpc :
+// CHECK: bb0
+// CHECK: alloc_ref
+// CHECK-NOT: init_existential_addr
+// CHECK-NOT: alloc_stack
+// CHECK-NOT: dealloc_stack
+// CHECK: function_ref
+// CHECK: apply
+// CHECK: return
+sil @something_ncpc : $@convention(thin) () -> Int {
+bb0:
+  %1 = alloc_stack $SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp
+  %2 = init_existential_addr %1 : $*SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp, $SomeNoClassComp
+  %3 = alloc_ref $SomeNoClassComp
+  store %3 to %2 : $*SomeNoClassComp 
+  %4 = alloc_stack $SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp
+  copy_addr %1 to [initialization] %4 : $*SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp
+  %5 = function_ref @something_to_specialize_ncpc : $@convention(thin) (@in SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp) -> Int
+  %6 = apply %5(%4) : $@convention(thin) (@in SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp) -> Int
+  dealloc_stack %4 : $*SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp 
+  dealloc_stack %1 : $*SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp
+  return %6 : $Int
+} 
+// CHECK-LABEL: sil shared [noinline] @$S26something_to_specialize_cpTf5n_n4main9SomeClassC_Tg5 : $@convention(thin) (@guaranteed SomeClass) -> Int {
+// CHECK: bb0({{.*}}):
+// CHECK-NOT: open_existential_ref
+// CHECK-NOT: witness_method
+// CHECK-NOT: apply
+// CHECK: integer_literal
+// CHECK: struct
+// CHECK: return
+sil shared [noinline] @something_to_specialize_cp : $@convention(thin) (@guaranteed SomeProtocol) -> Int {
+bb0(%0 : $SomeProtocol):
+  %2 = open_existential_ref %0 : $SomeProtocol to $@opened("D346AB00-F998-11E7-93AE-DCA9048B1C6D") SomeProtocol
+  %3 = witness_method $@opened("D346AB00-F998-11E7-93AE-DCA9048B1C6D") SomeProtocol, #SomeProtocol.foo!1 : <Self where Self : SomeProtocol> (Self) -> () -> Int, %2 : $@opened("D346AB00-F998-11E7-93AE-DCA9048B1C6D") SomeProtocol : $@convention(witness_method: SomeProtocol) <τ_0_0 where τ_0_0 : SomeProtocol> (@guaranteed τ_0_0) -> Int
+  %4 = apply %3<@opened("D346AB00-F998-11E7-93AE-DCA9048B1C6D") SomeProtocol>(%2) : $@convention(witness_method: SomeProtocol) <τ_0_0 where τ_0_0 : SomeProtocol> (@guaranteed τ_0_0) -> Int
+  return %4 : $Int
+}
+
+// CHECK-LABEL: sil shared [noinline] @$S27something_to_specialize_cpcTf5n_n4main13SomeClassCompC_Tg5 : $@convention(thin) (@owned SomeClassComp) -> Int {
+// CHECK: bb0({{.*}}):
+// CHECK-NOT: open_existential_ref
+// CHECK-NOT: witness_method
+// CHECK-NOT: apply
+// CHECK: integer_literal
+// CHECK: cond_fail
+// CHECK: struct
+// CHECK: return
+sil shared [noinline] @something_to_specialize_cpc : $@convention(thin) (@owned SomeClassProtocolComp & SomeOtherClassProtocolComp) -> Int {
+bb0(%0 : $SomeClassProtocolComp & SomeOtherClassProtocolComp):
+  %1 = open_existential_ref %0 : $SomeClassProtocolComp & SomeOtherClassProtocolComp to $@opened("802E080C-3447-11E8-888B-DCA9048B1C6D") SomeClassProtocolComp & SomeOtherClassProtocolComp
+  %2 = witness_method $@opened("802E080C-3447-11E8-888B-DCA9048B1C6D") SomeClassProtocolComp & SomeOtherClassProtocolComp, #SomeClassProtocolComp.foo_cpc!1 : <Self where Self : SomeClassProtocolComp> (Self) -> () -> Int, %1 : $@opened("802E080C-3447-11E8-888B-DCA9048B1C6D") SomeClassProtocolComp & SomeOtherClassProtocolComp : $@convention(witness_method: SomeClassProtocolComp) <τ_0_0 where τ_0_0 : SomeClassProtocolComp> (@guaranteed τ_0_0) -> Int 
+  %3 = apply %2<@opened("802E080C-3447-11E8-888B-DCA9048B1C6D") SomeClassProtocolComp & SomeOtherClassProtocolComp>(%1) : $@convention(witness_method: SomeClassProtocolComp) <τ_0_0 where τ_0_0 : SomeClassProtocolComp> (@guaranteed τ_0_0) -> Int
+  %4 = witness_method $@opened("802E080C-3447-11E8-888B-DCA9048B1C6D") SomeClassProtocolComp & SomeOtherClassProtocolComp, #SomeOtherClassProtocolComp.bar_cpc!1 : <Self where Self : SomeOtherClassProtocolComp> (Self) -> () -> Int, %1 : $@opened("802E080C-3447-11E8-888B-DCA9048B1C6D") SomeClassProtocolComp & SomeOtherClassProtocolComp : $@convention(witness_method: SomeOtherClassProtocolComp) <τ_0_0 where τ_0_0 : SomeOtherClassProtocolComp> (@guaranteed τ_0_0) -> Int
+  %5 = apply %4<@opened("802E080C-3447-11E8-888B-DCA9048B1C6D") SomeClassProtocolComp & SomeOtherClassProtocolComp>(%1) : $@convention(witness_method: SomeOtherClassProtocolComp) <τ_0_0 where τ_0_0 : SomeOtherClassProtocolComp> (@guaranteed τ_0_0) -> Int // type-defs: %2; user: %8
+  %6 = struct_extract %3 : $Int, #Int._value
+  %7 = struct_extract %5 : $Int, #Int._value
+  %8 = integer_literal $Builtin.Int1, -1
+  %9 = builtin "sadd_with_overflow_Int64"(%6 : $Builtin.Int64, %7 : $Builtin.Int64, %8 : $Builtin.Int1) : $(Builtin.Int64, Builtin.Int1)
+  %10 = tuple_extract %9 : $(Builtin.Int64, Builtin.Int1), 0
+  %11 = tuple_extract %9 : $(Builtin.Int64, Builtin.Int1), 1
+  cond_fail %11 : $Builtin.Int1
+  %12 = struct $Int (%10 : $Builtin.Int64)
+  return %12 : $Int
+}
+
+// CHECK-LABEL: sil shared [noinline] @$S27something_to_specialize_ncpTf5n_n4main11SomeNoClassC_Tg5 : $@convention(thin) (@owned SomeNoClass) -> Int {
+// CHECK: bb0({{.*}}):
+// CHECK-NOT: open_existential_addr
+// CHECK-NOT: witness_method
+// CHECK-NOT: apply
+// CHECK-NOT: destroy_addr
+// CHECK: integer_literal
+// CHECK: struct
+// CHECK: strong_release
+// CHECK: return
+sil hidden [noinline] @something_to_specialize_ncp : $@convention(thin) (@in SomeNoClassProtocol) -> Int {
+bb0(%0 : $*SomeNoClassProtocol):
+  %1 = open_existential_addr immutable_access %0 : $*SomeNoClassProtocol to $*@opened("1B0A5B84-3441-11E8-AC03-DCA9048B1C6D") SomeNoClassProtocol
+  %2 = witness_method $@opened("1B0A5B84-3441-11E8-AC03-DCA9048B1C6D") SomeNoClassProtocol, #SomeNoClassProtocol.foo_ncp!1 : <Self where Self : SomeNoClassProtocol> (Self) -> () -> Int, %1 : $*@opened("1B0A5B84-3441-11E8-AC03-DCA9048B1C6D") SomeNoClassProtocol : $@convention(witness_method: SomeNoClassProtocol) <τ_0_0 where τ_0_0 : SomeNoClassProtocol> (@in_guaranteed τ_0_0) -> Int 
+  %3 = apply %2<@opened("1B0A5B84-3441-11E8-AC03-DCA9048B1C6D") SomeNoClassProtocol>(%1) : $@convention(witness_method: SomeNoClassProtocol) <τ_0_0 where τ_0_0 : SomeNoClassProtocol> (@in_guaranteed τ_0_0) -> Int 
+  destroy_addr %0 : $*SomeNoClassProtocol
+  return %3 : $Int
+}
+
+// CHECK-LABEL: sil shared [noinline] @$S28something_to_specialize_ncpcTf5n_n4main15SomeNoClassCompC_Tg5 : $@convention(thin) (@owned SomeNoClassComp) -> Int {
+// CHECK: bb0({{.*}}):
+// CHECK-NOT: open_existential_addr
+// CHECK-NOT: witness_method
+// CHECK-NOT: apply
+// CHECK-NOT: destroy_addr
+// CHECK: integer_literal
+// CHECK: struct
+// CHECK: strong_release
+// CHECK: return
+sil hidden [noinline] @something_to_specialize_ncpc : $@convention(thin) (@in SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp) -> Int {
+bb0(%0 : $*SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp):
+  %1 = open_existential_addr immutable_access %0 : $*SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp to $*@opened("813A700E-346B-11E8-B68D-DCA9048B1C6D") SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp
+  %2 = witness_method $@opened("813A700E-346B-11E8-B68D-DCA9048B1C6D") SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp, #SomeNoClassProtocolComp.foo_ncpc!1 : <Self where Self : SomeNoClassProtocolComp> (Self) -> () -> Int, %1 : $*@opened("813A700E-346B-11E8-B68D-DCA9048B1C6D") SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp : $@convention(witness_method: SomeNoClassProtocolComp) <τ_0_0 where τ_0_0 : SomeNoClassProtocolComp> (@in_guaranteed τ_0_0) -> Int 
+  %3 = apply %2<@opened("813A700E-346B-11E8-B68D-DCA9048B1C6D") SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp>(%1) : $@convention(witness_method: SomeNoClassProtocolComp) <τ_0_0 where τ_0_0 : SomeNoClassProtocolComp> (@in_guaranteed τ_0_0) -> Int 
+  %4 = open_existential_addr immutable_access %0 : $*SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp to $*@opened("813A719E-346B-11E8-B68D-DCA9048B1C6D") SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp 
+  %5 = witness_method $@opened("813A719E-346B-11E8-B68D-DCA9048B1C6D") SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp, #SomeOtherNoClassProtocolComp.bar_ncpc!1 : <Self where Self : SomeOtherNoClassProtocolComp> (Self) -> () -> Int, %4 : $*@opened("813A719E-346B-11E8-B68D-DCA9048B1C6D") SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp : $@convention(witness_method: SomeOtherNoClassProtocolComp) <τ_0_0 where τ_0_0 : SomeOtherNoClassProtocolComp> (@in_guaranteed τ_0_0) -> Int 
+  %6 = apply %5<@opened("813A719E-346B-11E8-B68D-DCA9048B1C6D") SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp>(%4) : $@convention(witness_method: SomeOtherNoClassProtocolComp) <τ_0_0 where τ_0_0 : SomeOtherNoClassProtocolComp> (@in_guaranteed τ_0_0) -> Int
+  %7 = struct_extract %3 : $Int, #Int._value
+  %8 = struct_extract %6 : $Int, #Int._value
+  %9 = integer_literal $Builtin.Int1, -1
+  %10 = builtin "sadd_with_overflow_Int64"(%7 : $Builtin.Int64, %8 : $Builtin.Int64, %9 : $Builtin.Int1) : $(Builtin.Int64, Builtin.Int1)
+  %11 = tuple_extract %10 : $(Builtin.Int64, Builtin.Int1), 0
+  %12 = tuple_extract %10 : $(Builtin.Int64, Builtin.Int1), 1
+  cond_fail %12 : $Builtin.Int1
+  %13 = struct $Int (%11 : $Builtin.Int64)
+  destroy_addr %0 : $*SomeNoClassProtocolComp & SomeOtherNoClassProtocolComp
+  return %13 : $Int
+}
+
+sil_witness_table hidden SomeClass: SomeProtocol module test {
+  method #SomeProtocol.foo!1: <Self where Self : SomeProtocol> (Self) -> () -> Int : @foo	
+}
+sil_vtable SomeNoClass {
+  #SomeNoClass.foo_ncp!1: (SomeNoClass) -> () -> Int : @foo_ncp
+}
+sil_witness_table hidden SomeNoClass: SomeNoClassProtocol module test {
+  method #SomeNoClassProtocol.foo_ncp!1: <Self where Self : SomeNoClassProtocol> (Self) -> () -> Int : @foo_ncp_
+}
+sil_vtable SomeNoClassComp {
+  #SomeNoClassComp.foo_ncpc!1: (SomeNoClassComp) -> () -> Int : @foo_ncpc
+  #SomeNoClassComp.bar_ncpc!1: (SomeNoClassComp) -> () -> Int : @bar_ncpc
+}
+sil_witness_table hidden SomeNoClassComp: SomeNoClassProtocolComp module test {
+  method #SomeNoClassProtocolComp.foo_ncpc!1: <Self where Self : SomeNoClassProtocolComp> (Self) -> () -> Int : @foo_ncpc_
+}
+sil_witness_table hidden SomeNoClassComp: SomeOtherNoClassProtocolComp module test {
+  method #SomeOtherNoClassProtocolComp.bar_ncpc!1: <Self where Self : SomeOtherNoClassProtocolComp> (Self) -> () -> Int : @bar_ncpc_
+}
+sil_witness_table hidden SomeClassComp: SomeClassProtocolComp module test {
+  method #SomeClassProtocolComp.foo_cpc!1: <Self where Self : SomeClassProtocolComp> (Self) -> () -> Int : @foo_cpc
+}
+sil_witness_table hidden SomeClassComp: SomeOtherClassProtocolComp module test {
+  method #SomeOtherClassProtocolComp.bar_cpc!1: <Self where Self : SomeOtherClassProtocolComp> (Self) -> () -> Int : @bar_cpc
+}

@@ -29,6 +29,7 @@
 #include "swift/SILOptimizer/Utils/Local.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/SmallBitVector.h"
 
 namespace swift {
 
@@ -105,6 +106,21 @@ public:
     // Do an explicit clear, this shrinks the map if needed.
     WorklistMap.clear();
   }
+};
+
+/// This struct carries information about arguments of apply instructions
+/// for concrete type propagation.
+struct ApplyArgumentDescriptor {
+  SILValue NewArg;
+  CanType ConcreteType;
+#if 0
+  Optional<ProtocolConformanceRef> Conformance;
+#else
+  ArrayRef<Optional<ProtocolConformanceRef>> Conformance;
+#endif
+  ArchetypeType *OpenedArchetype;
+  ApplyArgumentDescriptor() {}
+  ApplyArgumentDescriptor(SILValue NewArg, CanType ConcreteType, ArrayRef<Optional<ProtocolConformanceRef>> Conformance, ArchetypeType *OpenedArchetype) : NewArg(NewArg), ConcreteType(ConcreteType), Conformance(Conformance), OpenedArchetype(OpenedArchetype) {}
 };
 
 /// This is a class which maintains the state of the combiner and simplifies
@@ -294,6 +310,10 @@ private:
   SILInstruction *propagateConcreteTypeOfInitExistential(FullApplySite AI,
                                                          WitnessMethodInst *WMI);
   SILInstruction *propagateConcreteTypeOfInitExistential(FullApplySite AI);
+
+  /// Create Apply Instruction with concrete types for arguments.
+  SILInstruction *createApplyWithConcreteType(FullApplySite AI, llvm::SmallBitVector &RelevantArgIndices,
+                                         llvm::SmallDenseMap<SILValue, ApplyArgumentDescriptor> &ArgDesc);
 
   /// Propagate concrete types to all apply arguments.
   SILInstruction *propagateConcreteTypeOfInitExistentialToAllApplyArgs(FullApplySite AI);

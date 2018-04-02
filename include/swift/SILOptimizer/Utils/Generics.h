@@ -20,7 +20,6 @@
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
-#include "swift/SILOptimizer/Analysis/ProtocolDevirtualizerAnalysis.h"
 #include "swift/SILOptimizer/Utils/FunctionSignatureOptUtils.h"
 #include "swift/SILOptimizer/Utils/Local.h"
 #include "swift/SILOptimizer/Utils/SpecializationMangler.h"
@@ -302,9 +301,16 @@ public:
   }
 };
 
-/// ProtocolDevirtualizer transformation class that creates a protocol 
+/// A descriptor to carry information from ExistentialTransform analysis 
+/// to transformation.
+struct ExistentialTransformArgumentDescriptor {
+  OpenedExistentialAccess AccessType;
+  bool DestroyAddrUse;
+};
+
+/// ExistentialSpecializer transformation class that creates a protocol 
 /// constrained generic and a thunk.
-class ProtocolDevirtualizerTransform {
+class ExistentialSpecializerTransform {
   /// The original function to analyze and transform.
   SILFunction *F;
 
@@ -314,48 +320,55 @@ class ProtocolDevirtualizerTransform {
   /// The function signature mangler we are using.
   Mangle::FunctionSignatureSpecializationMangler &Mangler;
 
-  /// Map Arguments to their ProtocolTypes.
-  llvm::SmallDenseMap<int, std::pair<ProtocolDecl *, ClassDecl *>> &Arg2DeclMap;
+  /// List of arguments and their descriptors to specialize
+  llvm::SmallDenseMap<int, ExistentialTransformArgumentDescriptor> &ExistentialArgDescriptor;
 
   /// Argument to Generic Type Map for NewF.
   llvm::SmallDenseMap<int, GenericTypeParamType *> Arg2GenericTypeMap;
 
+  /// Argument to Requirements Map for NewF.
+  llvm::SmallDenseMap<int, SmallVector<Requirement, 4>> Arg2RequirementsMap;
+
   // Allocate the argument descriptors.
   llvm::SmallVector<ArgumentDescriptor, 4> &ArgumentDescList;
 
+  /// List of argument indices to specialize
+  //llvm::SmallBitVector OpenedExistentialArgIndices;
+
   /// Create the Devirtualized Inner Function.
-  void createDevirtualizedProtocolFunction();
+  void createExistentialSpecializedFunction();
 
   /// Create a name for the inner function.
-  std::string createDevirtualizedFunctionName();
+  std::string createExistentialSpecializedFunctionName();
 
   /// Create the new devirtualized protocol function signature.
-  CanSILFunctionType createDevirtualizedFunctionType();
+  CanSILFunctionType createExistentialSpecializedFunctionType();
 
   /// Populate the body of NewF.
-  void populateProtocolConstrainedGenericFunction(const SILDebugScope *DS);
+  void populateSpecializedGenericFunction();
 
   /// Create the thunk.
   void populateThunkBody();
 
   public:
   /// Constructor.
-  ProtocolDevirtualizerTransform(
+  ExistentialSpecializerTransform(
               SILFunction *F,
               Mangle::FunctionSignatureSpecializationMangler &Mangler,
               llvm::SmallVector<ArgumentDescriptor, 4> &ADL,
-              llvm::SmallDenseMap<int, std::pair<ProtocolDecl *, ClassDecl *>> &Arg2DeclMap
-            ) : F(F), NewF(nullptr), Mangler(Mangler), Arg2DeclMap(Arg2DeclMap) , ArgumentDescList(ADL) {}
+              llvm::SmallDenseMap<int, ExistentialTransformArgumentDescriptor> &ExistentialArgDescriptor
+            ) : F(F), NewF(nullptr), Mangler(Mangler), ExistentialArgDescriptor(ExistentialArgDescriptor) , ArgumentDescList(ADL) {}
 
   /// Return the optimized iner function.
-  SILFunction *getDevirtualizedProtocolFunction() { return NewF; }
+  SILFunction *getExistentialSpecializedFunction() { return NewF; }
 
-  /// Run the optimization.
+  /// External function for the optimization.
   bool run() {
-    createDevirtualizedProtocolFunction();
+    createExistentialSpecializedFunction();
     return true;
   }
 };
+
 
 // =============================================================================
 // Prespecialized symbol lookup.
