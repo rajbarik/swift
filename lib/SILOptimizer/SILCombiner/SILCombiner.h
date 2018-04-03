@@ -113,11 +113,7 @@ public:
 struct ApplyArgumentDescriptor {
   SILValue NewArg;
   CanType ConcreteType;
-#if 0
-  Optional<ProtocolConformanceRef> Conformance;
-#else
   ArrayRef<Optional<ProtocolConformanceRef>> Conformance;
-#endif
   ArchetypeType *OpenedArchetype;
   ApplyArgumentDescriptor() {}
   ApplyArgumentDescriptor(SILValue NewArg, CanType ConcreteType, ArrayRef<Optional<ProtocolConformanceRef>> Conformance, ArchetypeType *OpenedArchetype) : NewArg(NewArg), ConcreteType(ConcreteType), Conformance(Conformance), OpenedArchetype(OpenedArchetype) {}

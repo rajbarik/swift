@@ -1256,14 +1256,6 @@ SILCombiner::propagateConcreteTypeOfInitExistentialToAllApplyArgs(FullApplySite 
   if(!FnTy->isPolymorphic()) 
     return nullptr;
 
-#if 0
-  /// Only choose a select few function representations for specilization.
-  if (Callee->getRepresentation() == SILFunctionTypeRepresentation::ObjCMethod || 
-      Callee->getRepresentation() == SILFunctionTypeRepresentation::Block) {
-    return nullptr;
-  }
-#endif
-
   /// Find a mapping from Archetype to the Conformances declaration.
   ArrayRef<Substitution> CallerSubs = Callee->getForwardingSubstitutions();
   llvm::DenseMap<Type, ArrayRef<ProtocolConformanceRef>> GenericType2ProtocolMap;
@@ -1722,9 +1714,9 @@ SILInstruction *SILCombiner::visitTryApplyInst(TryApplyInst *AI) {
   if (isa<FunctionRefInst>(AI->getCallee())) {
     if (propagateConcreteTypeOfInitExistential(AI)) {
       return nullptr;
-    } /*else if (propagateConcreteTypeOfInitExistentialToAllApplyArgs(AI)) {
+    } else if (propagateConcreteTypeOfInitExistentialToAllApplyArgs(AI)) {
       return nullptr;
-    }*/
+    }
   }
 
   return nullptr;
