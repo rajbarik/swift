@@ -1334,6 +1334,10 @@ SILCombiner::propagateConcreteTypeOfInitExistentialToAllApplyArgs(FullApplySite 
         continue;
       }
 
+      if (ConcreteType->isOpenedExistential()) {
+        continue;
+      }
+
       auto ExistentialSig = AI.getModule().getASTContext()
                                   .getExistentialSignature(ExistentialType,
                                    AI.getModule().getSwiftModule());
