@@ -53,9 +53,12 @@ class GenericSpecializer : public SILFunctionTransform {
 /// ExistentialSpecializer class.
 class ExistentialSpecializer : public SILFunctionTransform {
 
-  /// Determine if the current function is a target for existential specialization of args.
-  bool canSpecializeExistentialArgsInFunction(ApplySite &Apply, 
-        llvm::SmallDenseMap<int, ExistentialTransformArgumentDescriptor> &ExistentialArgDescriptor);
+  /// Determine if the current function is a target for existential
+  /// specialization of args.
+  bool canSpecializeExistentialArgsInFunction(
+      ApplySite &Apply,
+      llvm::SmallDenseMap<int, ExistentialTransformArgumentDescriptor>
+          &ExistentialArgDescriptor);
 
   /// Can Callee be specialized?
   bool canSpecializeCalleeFunction(ApplySite &Apply);
@@ -67,7 +70,6 @@ class ExistentialSpecializer : public SILFunctionTransform {
   CallerAnalysis *CA;
 
 public:
-
   void run() override {
 
     auto *F = getFunction();
@@ -76,7 +78,7 @@ public:
     if (!F->shouldOptimize()) {
       return;
     }
-    
+
     /// Get CallerAnalysis information handy.
     CA = PM->getAnalysis<CallerAnalysis>();
 
@@ -169,133 +171,89 @@ bool GenericSpecializer::specializeAppliesInFunction(SILFunction &F) {
   return Changed;
 }
 
-/// Determine the following pattern.
-/// %3 = global_addr @$P : $*SomeP
-/// %4 = init_existential_addr %3 : $*SomeP, $SomeC
-/// %5 = alloc_ref $SomeC
-/// store %5 to %4 : $*SomeC
-static SILValue findInitExistentialFromGlobalAddr(GlobalAddrInst *GAI) {
-  /// Check for a single InitExistential.
-  SILInstruction *SingleIE = NULL;
-  for (auto Use : GAI->getUses()) {
-    auto *User = Use->getUser();
-    if(auto *InitExistential = dyn_cast<InitExistentialAddrInst>(User)) {
-      if (SingleIE) return SILValue();
-      SingleIE = InitExistential;
-    }
-  }
-  if (!SingleIE) return SILValue();
-  return cast<InitExistentialAddrInst>(SingleIE);
-}
-
-/// Get the Stack Address.
-static SILValue getStackAddress(AllocStackInst *ASI, SILInstruction *ASIUser, bool &Copied) {
-  SILInstruction *OneWrite = nullptr;
-  for (auto Use : ASI->getUses()) {
-    auto *User = Use->getUser();
-    if (isa<DeallocStackInst>(User) || isa<DebugValueAddrInst>(User) ||
-        isa<DestroyAddrInst>(User) || isa<WitnessMethodInst>(User) ||
-        isa<DeinitExistentialAddrInst>(User) ||
-        isa<OpenExistentialAddrInst>(User) ||
-        User == ASIUser) {
-      continue;
-    }
-    if (auto *CAI = dyn_cast<CopyAddrInst>(User)) {
-      if (CAI->getDest() == ASI) {
-        if (OneWrite)
-          return SILValue();
-        OneWrite = CAI;
-        Copied = true;
-      }
-      continue;
-    }
-    if (isa<InitExistentialAddrInst>(User)) {
-      if (OneWrite)
-        return SILValue();
-      OneWrite = User;
-      continue;
-    }
-    if (isa<ApplyInst>(User) || isa<TryApplyInst>(User)) {
-      auto Index = Use->getOperandNumber() - ApplyInst::getArgumentOperandNumber();
-      auto Convention = FullApplySite(User).getArgumentConvention(Index);
-      if (Convention != SILArgumentConvention::Indirect_In &&
-          Convention != SILArgumentConvention::Indirect_In_Guaranteed)
-        return SILValue();
-      continue;
-    }
-    return SILValue();
-  }
-  if (!OneWrite) 
-    return SILValue();
-  SILBasicBlock *BB = OneWrite->getParent();
-  if (BB != ASI->getParent() && BB != ASIUser->getParent())
-    return SILValue();
-  if (auto *CAI = dyn_cast<CopyAddrInst>(OneWrite)) {
-    SILValue CAISource = CAI->getSrc();
-    if (auto *ASI = dyn_cast<AllocStackInst>(CAISource))
-      return getStackAddress(ASI, CAI, Copied);
-    if (auto *GAI = dyn_cast<GlobalAddrInst>(CAISource)) {
-      return findInitExistentialFromGlobalAddr(GAI);
-    }
-    return CAISource;
-  }
-  return cast<InitExistentialAddrInst>(OneWrite);
-}
-
-
-/// Find the concrete type of the existential argument.
-static bool findConcreteType(ApplySite AI, SILValue Arg, CanType &ConcreteType) {
-  bool Copied = false;
-
-  /// Ignore any unconditional cast instructions. Is it Safe? Do we need to
-  /// also add UnconditionalCheckedCastAddrInst? TODO.
-  if (auto *Instance = dyn_cast<UnconditionalCheckedCastInst>(Arg)) {
-      Arg = Instance->getOperand(); 
-  }
-  /// Handle AllocStack Instruction.
-  if (auto *Instance = dyn_cast<AllocStackInst>(Arg)) {
-    if (SILValue Src = getStackAddress(Instance, AI.getInstruction(), Copied)) {
-      Arg = Src;
-    }
-  }
-
-  /// init_existential_addr instructions
-  if (auto *Open = dyn_cast<OpenExistentialAddrInst>(Arg)) {
-    auto Op = Open->getOperand();
-    auto *ASI = dyn_cast<AllocStackInst>(Op);
-    if (!ASI)
-      return false;
-
-    SILValue StackWrite = getStackAddress(ASI, Open, Copied);
-    if (!StackWrite)
-      return false;
-
-    if(auto *InitExistential = dyn_cast<InitExistentialAddrInst>(StackWrite)) {
-      ConcreteType = InitExistential->getFormalConcreteType();
-      return true;
-    }
-  } else if(auto *InitExistential = dyn_cast<InitExistentialAddrInst>(Arg)) {
-      ConcreteType = InitExistential->getFormalConcreteType();
-      return true;
-  } else if (auto *Open = dyn_cast<OpenExistentialRefInst>(Arg)) {
-    if (auto *InitExistential = dyn_cast<InitExistentialRefInst>(Open->getOperand())) {
-      ConcreteType =  InitExistential->getFormalConcreteType();
-      return true;
-    }
-  } else if (auto *InitExistential = dyn_cast<InitExistentialRefInst>(Arg)) {
-    ConcreteType =  InitExistential->getFormalConcreteType();
+static bool findConcreteTypeFromIEInst(SILInstruction *Arg,
+                                       CanType &ConcreteType) {
+  if (auto *IER = dyn_cast<InitExistentialRefInst>(Arg)) {
+    ConcreteType = IER->getFormalConcreteType();
     return true;
-  } else if(auto *InitExistential = dyn_cast<InitExistentialAddrInst>(Arg)) {
-    ConcreteType = InitExistential->getFormalConcreteType();
+  } else if (auto *IE = dyn_cast<InitExistentialAddrInst>(Arg)) {
+    ConcreteType = IE->getFormalConcreteType();
     return true;
   }
   return false;
 }
 
+static bool findConcreteTypeFromIEVal(SILValue Arg, CanType &ConcreteType) {
+  if (auto *IER = dyn_cast<InitExistentialRefInst>(Arg)) {
+    ConcreteType = IER->getFormalConcreteType();
+    return true;
+  } else if (auto *IE = dyn_cast<InitExistentialAddrInst>(Arg)) {
+    ConcreteType = IE->getFormalConcreteType();
+    return true;
+  }
+  return false;
+}
+
+/// Find the concrete type of the existential argument.
+static bool findConcreteType(ApplySite AI, SILValue Arg,
+                             CanType &ConcreteType) {
+  bool isCopied = false;
+
+  /// Ignore any unconditional cast instructions. Is it Safe? Do we need to
+  /// also add UnconditionalCheckedCastAddrInst? TODO.
+  if (auto *Instance = dyn_cast<UnconditionalCheckedCastInst>(Arg)) {
+    Arg = Instance->getOperand();
+  }
+
+  /// Return init_existential if the Arg is global_addr.
+  if (auto *GAI = dyn_cast<GlobalAddrInst>(Arg)) {
+    SILValue InitExistential =
+        findInitExistentialFromGlobalAddr(GAI, AI.getInstruction());
+    /// If the Arg is already init_existential, return the concrete type.
+    if (findConcreteTypeFromIEVal(InitExistential, ConcreteType)) {
+      return true;
+    }
+  }
+
+  SILValue OrigArg = Arg;
+
+  /// Handle AllocStack instruction separately. 
+  if (auto *Instance = dyn_cast<AllocStackInst>(Arg)) {
+    if (SILValue Src =
+            getAddressOfStackInit(Instance, AI.getInstruction(), isCopied)) {
+      Arg = Src;
+    }
+  }
+
+  /// If the Arg is already init_existential, return the concrete type.
+  if (findConcreteTypeFromIEVal(Arg, ConcreteType)) {
+    return true;
+  }
+
+  /// Call findInitExistential and determine the init_existential.
+  ArchetypeType *OpenedArchetype = nullptr;
+  SILValue OpenedArchetypeDef;
+  auto FAS = FullApplySite::isa(AI.getInstruction());
+  if (!FAS)
+    return false;
+  SILInstruction *InitExistential = findInitExistential(
+      FAS, OrigArg, OpenedArchetype, OpenedArchetypeDef, isCopied);
+  if (!InitExistential) {
+    DEBUG(llvm::dbgs() << "Bail!...Did not find InitExistential\n";);
+    return false;
+  }
+
+  /// Return the concrete type from init_existential.
+  if (findConcreteTypeFromIEInst(InitExistential, ConcreteType))
+    return true;
+
+  return false;
+}
+
 /// Check if the callee uses the arg to dereference a witness method that
 /// would then be converted into a direct method call and perhaps inlined.
-static bool findIfCalleeUsesArgInWitnessMethod(SILValue Arg,
-        ExistentialTransformArgumentDescriptor &ETAD) {
+static bool findIfCalleeUsesArgInWitnessMethod(
+    SILValue Arg, ExistentialTransformArgumentDescriptor &ETAD) {
   bool PatternMatched = false;
   for (Operand *ArgUse : Arg->getUses()) {
     auto *ArgUser = ArgUse->getUser();
@@ -317,7 +275,10 @@ static bool findIfCalleeUsesArgInWitnessMethod(SILValue Arg,
 }
 
 /// Check if any argument to a function meet the criteria for specialization.
-bool ExistentialSpecializer::canSpecializeExistentialArgsInFunction(ApplySite &Apply, llvm::SmallDenseMap<int, ExistentialTransformArgumentDescriptor> &ExistentialArgDescriptor) {
+bool ExistentialSpecializer::canSpecializeExistentialArgsInFunction(
+    ApplySite &Apply,
+    llvm::SmallDenseMap<int, ExistentialTransformArgumentDescriptor>
+        &ExistentialArgDescriptor) {
   auto *F = Apply.getReferencedFunction();
   auto Args = F->begin()->getFunctionArguments();
   bool returnFlag = false;
@@ -327,40 +288,64 @@ bool ExistentialSpecializer::canSpecializeExistentialArgsInFunction(ApplySite &A
 
   /// Analyze the argument for protocol conformance.
   for (unsigned Idx = 0, Num = Args.size(); Idx < Num; ++Idx) {
-    if (PAI && (Idx < Num - minPartialAppliedArgs)) continue;
+    if (PAI && (Idx < Num - minPartialAppliedArgs))
+      continue;
     auto Arg = Args[Idx];
     auto ArgType = Arg->getType();
     auto SwiftArgType = ArgType.getSwiftRValueType();
-    if (!ArgType || !SwiftArgType 
-        || !(ArgType.isExistentialType()) 
-        || ArgType.isAnyObject()  
-        || SwiftArgType->isAny()
-        ) continue;
-    auto ExistentialRepr = Arg->getType().getPreferredExistentialRepresentation(F->getModule());
-    if (!(ExistentialRepr == ExistentialRepresentation::Opaque || ExistentialRepr == ExistentialRepresentation::Class)) continue; 
-    if (!(SwiftArgType->is<ProtocolType>() || 
-          SwiftArgType->is<ProtocolCompositionType>())) continue;
+    if (!ArgType || !SwiftArgType || !(ArgType.isExistentialType()) ||
+        ArgType.isAnyObject() || SwiftArgType->isAny())
+      continue;
+    auto ExistentialRepr =
+        Arg->getType().getPreferredExistentialRepresentation(F->getModule());
+    if (!(ExistentialRepr == ExistentialRepresentation::Opaque ||
+          ExistentialRepr == ExistentialRepresentation::Class))
+      continue;
 
     /// Find concrete type.
     CanType ConcreteType;
     ExistentialTransformArgumentDescriptor ETAD;
     ETAD.AccessType = OpenedExistentialAccess::Immutable;
     ETAD.DestroyAddrUse = false;
-    auto ApplyArg = Apply.getArgument(PAI ? Idx-Num+minPartialAppliedArgs : Idx);
+    auto ApplyArg =
+        Apply.getArgument(PAI ? Idx - Num + minPartialAppliedArgs : Idx);
     if (!findConcreteType(Apply, ApplyArg, ConcreteType)) {
-      DEBUG(llvm::dbgs() << ".. did not find concrete type.. bail..\n";);
+      DEBUG(llvm::dbgs()
+                << "Bail!...did not find concrete type for callee:"
+                << F->getName() << " in caller:"
+                << Apply.getInstruction()->getParent()->getParent()->getName()
+                << "\n";);
+      DEBUG({
+        llvm::dbgs() << "Caller:\n";
+        Apply.getInstruction()->getParent()->getParent()->dump();
+        llvm::dbgs() << "Callee:\n";
+        F->dump();
+      });
       continue;
     }
 
-    /// The caller should use it for a witness method.
-    if (!(findIfCalleeUsesArgInWitnessMethod(Arg, ETAD) && (ETAD.DestroyAddrUse || ((Args[Idx]->getType().getPreferredExistentialRepresentation(F->getModule())) == ExistentialRepresentation::Class)))) {
-      DEBUG(llvm::dbgs() << ".. no witness method and destroy use.. bail..\n";);
+    /// The caller should use the argument for a witness method in particular
+    /// for non class protocol, otherwise we would have to deal with crazy code
+    /// patterns. This condition must be relaxed in future.
+    if (((Args[Idx]->getType().getPreferredExistentialRepresentation(
+             F->getModule())) != ExistentialRepresentation::Class) &&
+        (!(findIfCalleeUsesArgInWitnessMethod(Arg, ETAD)))) {
+      DEBUG(llvm::dbgs()
+                << "Bail!...no witness method or destroy use found in callee:"
+                << Apply.getInstruction()->getParent()->getParent()->getName()
+                << "\n";);
+      DEBUG({
+        llvm::dbgs() << "Caller:\n";
+        Apply.getInstruction()->getParent()->getParent()->dump();
+        llvm::dbgs() << "Callee:\n";
+        F->dump();
+      });
       continue;
     }
     /// Save the protocol declaration.
-    ExistentialArgDescriptor[Idx]=ETAD;
-
-    DEBUG(llvm::dbgs() << "Function: " << F->getName() << " Arg:" << Idx << "has a concrete type.\n");
+    ExistentialArgDescriptor[Idx] = ETAD;
+    DEBUG(llvm::dbgs() << "Function: " << F->getName() << " Arg:" << Idx
+                       << "has a concrete type.\n");
     returnFlag |= true;
   }
   return returnFlag;
@@ -391,11 +376,12 @@ bool ExistentialSpecializer::canSpecializeCalleeFunction(ApplySite &Apply) {
     return false;
 
   /// Do not optimize always_inlinable functions.
-  if (Callee->getInlineStrategy() == Inline_t::AlwaysInline) 
+  if (Callee->getInlineStrategy() == Inline_t::AlwaysInline)
     return false;
 
   /// Only choose a select few function representations for specilization.
-  if (Callee->getRepresentation() == SILFunctionTypeRepresentation::ObjCMethod || 
+  if (Callee->getRepresentation() ==
+          SILFunctionTypeRepresentation::ObjCMethod ||
       Callee->getRepresentation() == SILFunctionTypeRepresentation::Block) {
     return false;
   }
@@ -403,7 +389,8 @@ bool ExistentialSpecializer::canSpecializeCalleeFunction(ApplySite &Apply) {
 }
 
 /// Specialize existential args passed to a function.
-void ExistentialSpecializer::specializeExistentialArgsInAppliesWithinFunction(SILFunction &F) {
+void ExistentialSpecializer::specializeExistentialArgsInAppliesWithinFunction(
+    SILFunction &F) {
   bool Changed = false;
   for (auto &BB : F) {
     for (auto It = BB.begin(), End = BB.end(); It != End; ++It) {
@@ -413,7 +400,7 @@ void ExistentialSpecializer::specializeExistentialArgsInAppliesWithinFunction(SI
       ApplySite Apply = ApplySite::isa(I);
       if (!Apply)
         continue;
-      
+
       /// Can the callee be specialized?
       if (!canSpecializeCalleeFunction(Apply))
         continue;
@@ -421,17 +408,24 @@ void ExistentialSpecializer::specializeExistentialArgsInAppliesWithinFunction(SI
       auto *Callee = Apply.getReferencedFunction();
 
       /// Determine the arguments that can be specialized.
-      llvm::SmallDenseMap<int, ExistentialTransformArgumentDescriptor> ExistentialArgDescriptor;
-      if (!canSpecializeExistentialArgsInFunction(Apply, ExistentialArgDescriptor)) {
-        DEBUG(llvm::dbgs() << "  cannot specialize existential args in function: " << Callee->getName() << " -> abort\n");
+      llvm::SmallDenseMap<int, ExistentialTransformArgumentDescriptor>
+          ExistentialArgDescriptor;
+      if (!canSpecializeExistentialArgsInFunction(Apply,
+                                                  ExistentialArgDescriptor)) {
+        DEBUG(
+            llvm::dbgs() << "  cannot specialize existential args in function: "
+                         << Callee->getName() << " -> abort\n");
         continue;
       }
 
-      DEBUG(llvm::dbgs() << "Function::" << Callee->getName() << " has an existential argument and can be optimized via ExistentialSpecializer\n");
+      DEBUG(llvm::dbgs() << "Function::" << Callee->getName()
+                         << " has an existential argument and can be optimized "
+                            "via ExistentialSpecializer\n");
 
       /// Name Mangler for naming the protocol constrained generic method.
-      auto P = Demangle::SpecializationPass::GenericSpecializer;
-      Mangle::FunctionSignatureSpecializationMangler Mangler(P, Callee->isSerialized(), Callee);
+      auto P = Demangle::SpecializationPass::FunctionSignatureOpts;
+      Mangle::FunctionSignatureSpecializationMangler Mangler(
+          P, Callee->isSerialized(), Callee);
 
       /// Save the arguments in a descriptor.
       llvm::SmallVector<ArgumentDescriptor, 4> ArgumentDescList;
@@ -441,24 +435,26 @@ void ExistentialSpecializer::specializeExistentialArgsInAppliesWithinFunction(SI
       }
 
       /// This is the function to optimize for existential specilizer.
-      DEBUG(llvm::dbgs() << "*** ExistentialSpecializer Pass on function: " << Callee->getName() << " ***\n");
-
+      DEBUG(llvm::dbgs() << "*** ExistentialSpecializer Pass on function: "
+                         << Callee->getName() << " ***\n");
 
       /// Instantiate the ExistentialSpecializerTransform pass.
-      ExistentialSpecializerTransform EST(Callee, Mangler, ArgumentDescList, ExistentialArgDescriptor);
+      ExistentialSpecializerTransform EST(Callee, Mangler, ArgumentDescList,
+                                          ExistentialArgDescriptor);
 
       /// Run the protocol devirtualizer.
       Changed = EST.run();
 
       if (Changed) {
         /// Update statistics on the number of functions devirtualized.
-        ++ NumFunctionsWithExistentialArgsSpecialized;
+        ++NumFunctionsWithExistentialArgsSpecialized;
 
         /// Make sure the PM knows about the new specialized inner function.
         notifyAddFunction(EST.getExistentialSpecializedFunction(), Callee);
 
         /// Invalidate analysis results of Callee.
-        PM->invalidateAnalysis(Callee, SILAnalysis::InvalidationKind::Everything);
+        PM->invalidateAnalysis(Callee,
+                               SILAnalysis::InvalidationKind::Everything);
       }
     }
   }

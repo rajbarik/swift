@@ -2003,6 +2003,11 @@ NodePointer Demangler::demangleFuncSpecParam(Node::IndexType ParamIdx) {
       return addChild(Param, createNode(
                 Node::Kind::FunctionSignatureSpecializationParamKind,
                 unsigned(FunctionSigSpecializationParamKind::BoxToStack)));
+
+    case 'e':
+      return addChild(Param, createNode(
+                Node::Kind::FunctionSignatureSpecializationParamKind,
+                unsigned(FunctionSigSpecializationParamKind::ExistentialSpecialized)));
     default:
       return nullptr;
   }

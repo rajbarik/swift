@@ -25,6 +25,7 @@
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
 #include "swift/SILOptimizer/Analysis/CFG.h"
 #include "swift/SILOptimizer/Analysis/ValueTracking.h"
+#include "swift/SILOptimizer/Utils/Local.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -600,160 +601,6 @@ SILCombiner::optimizeConcatenationOfStringLiterals(ApplyInst *AI) {
   return tryToConcatenateStrings(AI, Builder);
 }
 
-/// Determine the pattern for global_addr..
-/// %3 = global_addr @$P : $*SomeP 
-/// %4 = init_existential_addr %3 : $*SomeP, $SomeC
-/// %5 = alloc_ref $SomeC
-/// store %5 to %4 : $*SomeC
-static SILValue findInitExistentialFromGlobalAddr(GlobalAddrInst *GAI) {
-  /// Check for a single InitExistential.
-  SILInstruction *SingleIE = NULL;
-  for (auto Use : GAI->getUses()) {
-    auto *User = Use->getUser();
-    if(auto *InitExistential = dyn_cast<InitExistentialAddrInst>(User)) {
-      if (SingleIE) return SILValue();
-      SingleIE = InitExistential;
-    }
-  }
-  if (!SingleIE) return SILValue();
-  return cast<InitExistentialAddrInst>(SingleIE);
-}
-
-/// Returns the address of an object with which the stack location \p ASI is
-/// initialized. This is either a init_existential_addr or the destination of a
-/// copy_addr. Returns a null value if the address does not dominate the
-/// alloc_stack user \p ASIUser.
-/// If the value is copied from another stack location, \p isCopied is set to
-/// true.
-static SILValue getAddressOfStackInit(AllocStackInst *ASI,
-                                      SILInstruction *ASIUser,
-                                      bool &isCopied) {
-  SILInstruction *SingleWrite = nullptr;
-  // Check that this alloc_stack is initialized only once.
-  for (auto Use : ASI->getUses()) {
-    auto *User = Use->getUser();
-
-    // Ignore instructions which don't write to the stack location.
-    // Also ignore ASIUser (only kicks in if ASIUser is the original apply).
-    if (isa<DeallocStackInst>(User) || isa<DebugValueAddrInst>(User) ||
-        isa<DestroyAddrInst>(User) || isa<WitnessMethodInst>(User) ||
-        isa<DeinitExistentialAddrInst>(User) ||
-        isa<OpenExistentialAddrInst>(User) ||
-        User == ASIUser) {
-      continue;
-    }
-    if (auto *CAI = dyn_cast<CopyAddrInst>(User)) {
-      if (CAI->getDest() == ASI) {
-        if (SingleWrite)
-          return SILValue();
-        SingleWrite = CAI;
-        isCopied = true;
-      }
-      continue;
-    }
-    if (isa<InitExistentialAddrInst>(User)) {
-      if (SingleWrite)
-        return SILValue();
-      SingleWrite = User;
-      continue;
-    }
-    if (isa<ApplyInst>(User) || isa<TryApplyInst>(User)) {
-      // Ignore function calls which do not write to the stack location.
-      auto Idx = Use->getOperandNumber() - ApplyInst::getArgumentOperandNumber();
-      auto Conv = FullApplySite(User).getArgumentConvention(Idx);
-      if (Conv != SILArgumentConvention::Indirect_In &&
-          Conv != SILArgumentConvention::Indirect_In_Guaranteed)
-        return SILValue();
-      continue;
-    }
-    // Bail if there is any unknown (and potentially writing) instruction.
-    return SILValue();
-  }
-  if (!SingleWrite)
-    return SILValue();
-
-  // A very simple dominance check. As ASI is an operand of ASIUser,
-  // SingleWrite dominates ASIUser if it is in the same block as ASI or ASIUser.
-  SILBasicBlock *BB = SingleWrite->getParent();
-  if (BB != ASI->getParent() && BB != ASIUser->getParent())
-    return SILValue();
-
-  if (auto *CAI = dyn_cast<CopyAddrInst>(SingleWrite)) {
-    // Try to derive the type from the copy_addr that was used to
-    // initialize the alloc_stack.
-    SILValue CAISrc = CAI->getSrc();
-    if (auto *ASI = dyn_cast<AllocStackInst>(CAISrc))
-      return getAddressOfStackInit(ASI, CAI, isCopied);
-    // Check if the CAISrc is a global_addr.
-    if (auto *GAI = dyn_cast<GlobalAddrInst>(CAISrc)) {
-      return findInitExistentialFromGlobalAddr(GAI);
-    }
-    return CAISrc;
-  }
-  return cast<InitExistentialAddrInst>(SingleWrite);
-}
-
-
-/// Find the init_existential, which could be used to determine a concrete
-/// type of the \p Self.
-/// If the value is copied from another stack location, \p isCopied is set to
-/// true.
-static SILInstruction *findInitExistential(FullApplySite AI, SILValue Self,
-                                           ArchetypeType *&OpenedArchetype,
-                                           SILValue &OpenedArchetypeDef,
-                                           bool &isCopied) {
-  isCopied = false;
-  if (auto *Instance = dyn_cast<AllocStackInst>(Self)) {
-    // In case the Self operand is an alloc_stack where a copy_addr copies the
-    // result of an open_existential_addr to this stack location.
-    if (SILValue Src = getAddressOfStackInit(Instance, AI.getInstruction(),
-                                             isCopied)) {
-      Self = Src;
-    }
-  }
-
-  if (auto *Open = dyn_cast<OpenExistentialAddrInst>(Self)) {
-    auto Op = Open->getOperand();
-    auto *ASI = dyn_cast<AllocStackInst>(Op);
-    if (!ASI)
-      return nullptr;
-
-    SILValue StackWrite = getAddressOfStackInit(ASI, Open, isCopied);
-    if (!StackWrite)
-      return nullptr;
-
-    auto *IE = dyn_cast<InitExistentialAddrInst>(StackWrite);
-    if (!IE)
-      return nullptr;
-    OpenedArchetype = Open->getType().castTo<ArchetypeType>();
-    OpenedArchetypeDef = Open;
-    return IE;
-  }
-
-  if (auto *Open = dyn_cast<OpenExistentialRefInst>(Self)) {
-    if (auto *IE = dyn_cast<InitExistentialRefInst>(Open->getOperand())) {
-      OpenedArchetype = Open->getType().castTo<ArchetypeType>();
-      OpenedArchetypeDef = Open;
-      return IE;
-    }
-    return nullptr;
-  }
-
-  if (auto *Open = dyn_cast<OpenExistentialMetatypeInst>(Self)) {
-    if (auto *IE =
-          dyn_cast<InitExistentialMetatypeInst>(Open->getOperand())) {
-      auto Ty = Open->getType().getSwiftRValueType();
-      while (auto Metatype = dyn_cast<MetatypeType>(Ty))
-        Ty = Metatype.getInstanceType();
-      OpenedArchetype = cast<ArchetypeType>(Ty);
-      OpenedArchetypeDef = Open;
-      return IE;
-    }
-    return nullptr;
-  }
-  return nullptr;
-}
-
 /// Create a new apply instructions that uses the concrete type instead
 /// of the existential type.
 SILInstruction *
@@ -834,55 +681,79 @@ SILCombiner::createApplyWithConcreteType(FullApplySite AI,
 /// Create a new apply instructions that uses the concrete type instead
 /// of the existential type using a generic datas straucture that handles
 /// more than one argument and also not just self.
-SILInstruction *
-SILCombiner::createApplyWithConcreteType(FullApplySite AI,  llvm::SmallBitVector &RelevantArgIndices,
-                                         llvm::SmallDenseMap<SILValue, ApplyArgumentDescriptor> &ArgDesc) {
+SILInstruction *SILCombiner::createApplyWithConcreteType(
+    FullApplySite AI, llvm::SmallBitVector &RelevantArgIndices,
+    llvm::SmallDenseMap<SILValue, ApplyArgumentDescriptor> &ArgDesc) {
   // Create a set of arguments.
   SmallVector<SILValue, 8> Args;
-  llvm::SmallDenseMap<SubstitutableType *, Type> OpenedType2ConcreteTypeMap;
-  llvm::SmallDenseMap<Type, ArrayRef<Optional<ProtocolConformanceRef>>> ConcreteType2ConformanceMap;;
-
+  auto FnTy = AI.getCallee()->getType().castTo<SILFunctionType>();
+  auto FnSubsMap =
+      FnTy->getGenericSignature()->getSubstitutionMap(AI.getSubstitutions());
+  SubstitutionMap OpenedType2ConcreteTypeMap = FnSubsMap;
   auto Callee = AI.getReferencedFunction();
   auto FuncArgs = Callee->begin()->getFunctionArguments();
+  llvm::dbgs() << "createApply:: For Function=" << Callee->getName() << "\n";
   for (unsigned i = 0, e = FuncArgs.size(); i != e; ++i) {
     auto OrigApplyArg = AI.getArgument(i);
     if (RelevantArgIndices.test(i)) {
-      Args.push_back(ArgDesc[OrigApplyArg].NewArg);
-      OpenedType2ConcreteTypeMap[ArgDesc[OrigApplyArg].OpenedArchetype] = ArgDesc[OrigApplyArg].ConcreteType; 
-      ConcreteType2ConformanceMap[ArgDesc[OrigApplyArg].ConcreteType] = ArgDesc[OrigApplyArg].Conformance;
-    } else  {
+      llvm::dbgs() << "createApply:: Found concrete type for Arg:"
+                   << OrigApplyArg << "\n";
+      auto Arg = ArgDesc[OrigApplyArg].NewArg;
+      Args.push_back(Arg);
+      auto ConcreteType = ArgDesc[OrigApplyArg].ConcreteType;
+      auto OpenedArchetype = ArgDesc[OrigApplyArg].OpenedArchetype;
+      llvm::dbgs() << "OpenedArchetype=" << OpenedArchetype << "\n";
+      llvm::dbgs() << "ConcreteType=" << ConcreteType << "\n";
+      llvm::dbgs() << "OpenedType2ConcreteTypeMap before=\n";
+      OpenedType2ConcreteTypeMap.dump(llvm::dbgs());
+      OpenedType2ConcreteTypeMap = OpenedType2ConcreteTypeMap.subst(
+          [&](SubstitutableType *type) -> Type {
+            if (type == OpenedArchetype)
+              return ConcreteType;
+            return type;
+          },
+          LookUpConformanceInSignature(*(FnTy->getGenericSignature())));
+      llvm::dbgs() << "OpenedType2ConcreteTypeMap after=\n";
+      OpenedType2ConcreteTypeMap.dump(llvm::dbgs());
+    } else {
+#if 0
+      auto SwiftType = FuncArgs[i]->getType().getSwiftRValueType();
+      if (auto *GP = SwiftType->getAs<GenericTypeParamType>()){
+        ArchetypeType *Opened;
+        auto OpenedArchetype = SwiftType->openAnyExistentialType(Opened)->getCanonicalType();
+        OpenedType2ConcreteTypeMap = OpenedType2ConcreteTypeMap.subst(
+                                       [&](SubstitutableType *type) -> Type {
+                                         if (type == OpenedArchetype)
+                                           return OrigApplyArg->getType().getSwiftRValueType();
+                                         return type;
+                                       },
+                                       LookUpConformanceInSignature(*(FnTy->getGenericSignature()))
+        ); 
+      }
+#endif
       Args.push_back(OrigApplyArg);
     }
   }
-  auto FnTy = AI.getCallee()->getType().castTo<SILFunctionType>();
-  SILType NewSubstCalleeType;
-
-  // Form a new set of substitutions where Arg is
-  // replaced by a concrete type.
+  llvm::dbgs() << "createApply:: Apply substituion\n";
   SmallVector<Substitution, 8> Substitutions;
-  auto FnSubsMap =
-      FnTy->getGenericSignature()->getSubstitutionMap(AI.getSubstitutions());
-  auto FinalSubsMap = FnSubsMap.subst(
-      [&](SubstitutableType *type) -> Type {
-        return OpenedType2ConcreteTypeMap[type];
-      },
-      LookUpConformanceInSignature(*(FnTy->getGenericSignature()))
-    );
-  FnTy->getGenericSignature()->getSubstitutions(FinalSubsMap, Substitutions);
-  CanSILFunctionType SFT = FnTy->substGenericArgs(
-                                      AI.getModule(),
-                                      Substitutions);
-  NewSubstCalleeType = SILType::getPrimitiveObjectType(SFT);
+  FnTy->getGenericSignature()->getSubstitutions(OpenedType2ConcreteTypeMap,
+                                                Substitutions);
+  CanSILFunctionType SFT =
+      FnTy->substGenericArgs(AI.getModule(), Substitutions);
+  SILType::getPrimitiveObjectType(SFT);
   FullApplySite NewAI;
   Builder.setCurrentDebugScope(AI.getDebugScope());
   Builder.addOpenedArchetypeOperands(AI.getInstruction());
+  llvm::dbgs() << "createApply:: create Apply Instruction\n";
   if (auto *TAI = dyn_cast<TryApplyInst>(AI))
     NewAI = Builder.createTryApply(AI.getLoc(), AI.getCallee(), Substitutions,
                                    Args, TAI->getNormalBB(), TAI->getErrorBB());
   else
     NewAI = Builder.createApply(AI.getLoc(), AI.getCallee(), Substitutions,
                                 Args, cast<ApplyInst>(AI)->isNonThrowing());
-
+  llvm::dbgs() << "CreateApply:: created Apply insn\n";
+  llvm::dbgs() << "Now delete the insn\n";
+  // replaceDeadApply(AI, cast<ApplyInst>(NewAI.getInstruction()));
   if (auto apply = dyn_cast<ApplyInst>(NewAI))
     replaceInstUsesWith(*cast<ApplyInst>(AI.getInstruction()), apply);
   eraseInstFromFunction(*AI.getInstruction());
@@ -1240,9 +1111,11 @@ SILCombiner::propagateConcreteTypeOfInitExistential(FullApplySite AI) {
   return propagateConcreteTypeOfInitExistential(AI, PD, PropagateIntoOperand);
 }
 
-/// A peephole optimizer that propagates concrete types of all arguments to Apply.
+/// A peephole optimizer that propagates concrete types of all arguments to
+/// Apply.
 SILInstruction *
-SILCombiner::propagateConcreteTypeOfInitExistentialToAllApplyArgs(FullApplySite AI) {
+SILCombiner::propagateConcreteTypeOfInitExistentialToAllApplyArgs(
+    FullApplySite AI) {
   /// Check if legal to perform propagation.
   if (!AI.hasSubstitutions())
     return nullptr;
@@ -1252,26 +1125,8 @@ SILCombiner::propagateConcreteTypeOfInitExistentialToAllApplyArgs(FullApplySite 
 
   auto FnTy = AI.getCallee()->getType().castTo<SILFunctionType>();
 
-  /// We target only polymorhphic types.
-  if(!FnTy->isPolymorphic()) 
-    return nullptr;
-
-  /// Find a mapping from Archetype to the Conformances declaration.
-  ArrayRef<Substitution> CallerSubs = Callee->getForwardingSubstitutions();
-  llvm::DenseMap<Type, ArrayRef<ProtocolConformanceRef>> GenericType2ProtocolMap;
-  for(auto &sub : CallerSubs) {
-    auto ReplacementType = sub.getReplacement();
-    auto Conformances = sub.getConformances();
-    ArchetypeType * ArcheType;
-    if (ReplacementType->hasArchetype() && 
-      (ArcheType = ReplacementType->getAs<ArchetypeType>()) &&
-      (Conformances.size() >= 1)) {
-      GenericType2ProtocolMap[ArcheType->getInterfaceType()] = Conformances;
-    }
-  }
-
-  /// Bail if no mapping exists.
-  if (GenericType2ProtocolMap.size() < 1) 
+  /// We target only polymorhphic types. Need to be extended in future.
+  if (!FnTy->isPolymorphic())
     return nullptr;
 
   auto Args = Callee->begin()->getFunctionArguments();
@@ -1280,19 +1135,6 @@ SILCombiner::propagateConcreteTypeOfInitExistentialToAllApplyArgs(FullApplySite 
   llvm::SmallBitVector RelevantArgIndices;
   RelevantArgIndices.resize(Args.size());
   RelevantArgIndices.reset();
-
-  /// We are looking for the following  pattern (can be extended in the future).
-  /// %0 = alloc_ref $SomeClass
-  /// %1 = init_existential_ref %0 : $SomeClass : $SomeClass, $SomeProtocol
-  /// %2 = function_ref @something_to_devirtualize : $@convention(thin) (@guaranteed SomeProtocol) -> Int
-  /// %3 = apply %2(%1) : $@convention(thin) (@guaranteed SomeProtocol) -> Int
-
-  /// Another pattern with addr.
-  /// %8 = alloc_stack $SomeNoClassProtocol
-  /// copy_addr %3 to [initialization] %8 : $*SomeNoClassProtocol
-  /// %10 = open_existential_addr mutable_access %8 : $*SomeNoClassProtocol to $*@opened("D8124070-2BA9-11E8-8E37-DCA9048B1C6D") SomeNoClassProtocol
-  /// %11 = function_ref @$S3ncp8wrap_foo1aSiAA19SomeNoClassProtocol_p_tFTf5n_nTf4g_n : $@convention(thin) <τ_0_0 where τ_0_0 : SomeNoClassProtocol> (@in_guaranteed τ_0_0) -> Int 
-  /// %12 = apply %11<@opened("D8124070-2BA9-11E8-8E37-DCA9048B1C6D") SomeNoClassProtocol>(%10) : $@convention(thin) <τ_0_0 where τ_0_0 : SomeNoClassProtocol> (@in_guaranteed τ_0_0) -> Int 
 
   for (unsigned i = 0, e = Args.size(); i != e; ++i) {
     auto ArgType = Args[i]->getType();
@@ -1303,66 +1145,94 @@ SILCombiner::propagateConcreteTypeOfInitExistentialToAllApplyArgs(FullApplySite 
     SILInstruction *InitExistential;
     ArchetypeType *OpenedArchetype = nullptr;
     SILValue OpenedArchetypeDef;
+    Type ContextTy;
     bool isCopied = false;
 
-    InitExistential = findInitExistential(AI, OrigApplyArg, OpenedArchetype, OpenedArchetypeDef, isCopied);
-    if (!InitExistential) 
+    /// We are looking for the following  patterns:
+    /// %0 = alloc_ref $SomeClass
+    /// %1 = init_existential_ref %0 : $SomeClass : $SomeClass, $SomeProtocol
+    /// %2 = function_ref @something_to_devirtualize : $@convention(thin)
+    /// (@guaranteed SomeProtocol) -> Int %3 = apply %2(%1) : $@convention(thin)
+    /// (@guaranteed SomeProtocol) -> Int 
+    /// Another pattern with addr. 
+    /// %8 =  alloc_stack $SomeNoClassProtocol 
+    /// copy_addr %3 to [initialization] %8 : $*SomeNoClassProtocol 
+    /// %10 = open_existential_addr mutable_access %8 :
+    /// $*SomeNoClassProtocol to
+    /// $*@opened("D8124070-2BA9-11E8-8E37-DCA9048B1C6D") SomeNoClassProtocol
+    /// %11 = function_ref
+    /// @$S3ncp8wrap_foo1aSiAA19SomeNoClassProtocol_p_tFTf5n_nTf4g_n :
+    /// $@convention(thin) <τ_0_0 where τ_0_0 : SomeNoClassProtocol>
+    /// (@in_guaranteed τ_0_0) -> Int %12 = apply
+    /// %11<@opened("D8124070-2BA9-11E8-8E37-DCA9048B1C6D")
+    /// SomeNoClassProtocol>(%10) : $@convention(thin) <τ_0_0 where τ_0_0 :
+    /// SomeNoClassProtocol> (@in_guaranteed τ_0_0) -> Int
+
+    InitExistential = findInitExistential(AI, OrigApplyArg, OpenedArchetype,
+                                          OpenedArchetypeDef, isCopied);
+    /// Ideally this code should go inside findInitExistential. TODO.
+    if (!InitExistential) {
+      if (auto *Open = dyn_cast<OpenExistentialAddrInst>(OrigApplyArg)) {
+        auto Op = Open->getOperand();
+        if (auto *GAI = dyn_cast<GlobalAddrInst>(Op)) {
+          SILValue IEVal =
+              findInitExistentialFromGlobalAddr(GAI, AI.getInstruction());
+          InitExistential = dyn_cast<InitExistentialAddrInst>(IEVal);
+          OpenedArchetype = Open->getType().castTo<ArchetypeType>();
+          OpenedArchetypeDef = Open;
+        }
+      }
+    }
+    /// Bail, if we did not find InitExistential.
+    if (!InitExistential)
       continue;
 
     /// Check all conditions for pattern matching.
-    if (ArgASTType->hasArchetype() && (ArcheType = ArgASTType->getAs<ArchetypeType>()) && 
-        (ArcheType->getInterfaceType()->is<GenericTypeParamType>()) && 
-        (GenericType2ProtocolMap.find(ArcheType->getInterfaceType()) != GenericType2ProtocolMap.end())
-      ) {
-
-      ArrayRef<ProtocolConformanceRef> Conformances;
+    if (ArgASTType->hasArchetype() &&
+        (ArcheType = ArgASTType->getAs<ArchetypeType>()) &&
+        (ArcheType->getInterfaceType()->is<GenericTypeParamType>()) &&
+        (ContextTy =
+             Callee->mapTypeIntoContext(ArcheType->getInterfaceType()))) {
+      //ArrayRef<ProtocolConformanceRef> Conformances;
       CanType ConcreteType;
       SILValue NewApplyArg;
-      CanType ExistentialType;
 
       if (auto IE = dyn_cast<InitExistentialAddrInst>(InitExistential)) {
-        Conformances = IE->getConformances();
+        llvm::dbgs() << "IE=";
+        IE->dump();
+        //Conformances = IE->getConformances();
         ConcreteType = IE->getFormalConcreteType();
         NewApplyArg = IE;
-        ExistentialType = IE->getOperand()->getType().getSwiftRValueType();
       } else if (auto IER = dyn_cast<InitExistentialRefInst>(InitExistential)) {
-        Conformances = IER->getConformances();
+        llvm::dbgs() << "IER=";
+        IER->dump();
+        //Conformances = IER->getConformances();
         ConcreteType = IER->getFormalConcreteType();
         NewApplyArg = IER->getOperand();
-        ExistentialType = IER->getType().getSwiftRValueType();
       } else {
         continue;
       }
 
-      if (ConcreteType->isOpenedExistential()) {
+      /// This case needs to be handled in future.
+      if (ConcreteType ->isOpenedExistential() ) {
+        llvm::dbgs() << "Bail! ConcreteType is an OpenedExistential or is a "
+                        "GenericType\n";
         continue;
       }
 
-      auto ExistentialSig = AI.getModule().getASTContext()
-                                  .getExistentialSignature(ExistentialType,
-                                   AI.getModule().getSwiftModule());
-      Substitution ConcreteSub(ConcreteType, Conformances);
-      auto SubMap = ExistentialSig->getSubstitutionMap({&ConcreteSub, 1});
-      /// Extend this to recursive; TODO.
-      auto ConformancesInDeclaration = GenericType2ProtocolMap[ArcheType->getInterfaceType()];
-      SmallVector<Optional<ProtocolConformanceRef>, 1> NewConformances;
-      for(auto CFM : ConformancesInDeclaration) {
-        if(auto conform = SubMap.lookupConformance(
-                  CanType(ExistentialSig->getGenericParams()[0]), CFM.getRequirement()))
-          NewConformances.push_back(conform);
-      }
-      ArrayRef<Optional<ProtocolConformanceRef>> Conformance = AI.getModule().getASTContext().AllocateCopy(NewConformances);
-      ApplyArgumentDescriptor NewArgDesc(NewApplyArg, ConcreteType, Conformance, OpenedArchetype);;
-      ArgDesc[OrigApplyArg] = NewArgDesc; 
-      RelevantArgIndices.set(i); 
-    } 
+      /// Construct a descriptor for this argument.
+      ApplyArgumentDescriptor NewArgDesc(NewApplyArg, ConcreteType,
+                                         OpenedArchetype);
+      ArgDesc[OrigApplyArg] = NewArgDesc;
+      RelevantArgIndices.set(i);
+    }
   }
-  /// Bail if we did not find a pattern.
-  if (!RelevantArgIndices.any())  
+  /// Bail if we did not find the pattern we were looking for.
+  if (!RelevantArgIndices.any())
     return nullptr;
 
   // Create a new apply instruction that uses the concrete type.
-  auto *NewAI = createApplyWithConcreteType( AI, RelevantArgIndices, ArgDesc);
+  auto *NewAI = createApplyWithConcreteType(AI, RelevantArgIndices, ArgDesc);
   return NewAI;
 }
 

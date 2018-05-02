@@ -169,6 +169,11 @@ void FunctionSignatureSpecializationMangler::setArgumentBoxToStack(
       ArgumentModifierIntBase(ArgumentModifier::BoxToStack);
 }
 
+void FunctionSignatureSpecializationMangler::setArgumentExistentialSpecialized(
+    unsigned OrigArgIdx) {
+  OrigArgs[OrigArgIdx].first = ArgumentModifierIntBase(ArgumentModifier::ExistentialSpecialized);
+}
+
 void
 FunctionSignatureSpecializationMangler::
 setReturnValueOwnedToUnowned() {
@@ -281,6 +286,10 @@ void FunctionSignatureSpecializationMangler::mangleArgument(
     return;
   }
 
+  if (ArgMod == ArgumentModifierIntBase(ArgumentModifier::ExistentialSpecialized)) {
+    ArgOpBuffer << 'e';
+    return;
+  }
   bool hasSomeMod = false;
   if (ArgMod & ArgumentModifierIntBase(ArgumentModifier::Dead)) {
     ArgOpBuffer << 'd';

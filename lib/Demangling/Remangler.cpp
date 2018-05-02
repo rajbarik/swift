@@ -1014,6 +1014,9 @@ void Remangler::mangleFunctionSignatureSpecializationParam(Node *node) {
     case FunctionSigSpecializationParamKind::BoxToStack:
       Buffer << 's';
       return;
+    case FunctionSigSpecializationParamKind::ExistentialSpecialized:
+      Buffer << 'e';
+      return;
     case FunctionSigSpecializationParamKind::SROA:
       Buffer << 'x';
       return;

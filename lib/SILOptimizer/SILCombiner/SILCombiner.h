@@ -21,6 +21,7 @@
 #ifndef SWIFT_SILOPTIMIZER_PASSMANAGER_SILCOMBINER_H
 #define SWIFT_SILOPTIMIZER_PASSMANAGER_SILCOMBINER_H
 
+#include "SILCombinerApplyDesc.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILValue.h"
@@ -106,17 +107,6 @@ public:
     // Do an explicit clear, this shrinks the map if needed.
     WorklistMap.clear();
   }
-};
-
-/// This struct carries information about arguments of apply instructions
-/// for concrete type propagation.
-struct ApplyArgumentDescriptor {
-  SILValue NewArg;
-  CanType ConcreteType;
-  ArrayRef<Optional<ProtocolConformanceRef>> Conformance;
-  ArchetypeType *OpenedArchetype;
-  ApplyArgumentDescriptor() {}
-  ApplyArgumentDescriptor(SILValue NewArg, CanType ConcreteType, ArrayRef<Optional<ProtocolConformanceRef>> Conformance, ArchetypeType *OpenedArchetype) : NewArg(NewArg), ConcreteType(ConcreteType), Conformance(Conformance), OpenedArchetype(OpenedArchetype) {}
 };
 
 /// This is a class which maintains the state of the combiner and simplifies

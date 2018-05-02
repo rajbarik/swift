@@ -752,6 +752,7 @@ unsigned NodePrinter::printFunctionSigSpecializationParam(NodePointer Node,
   switch (K) {
   case FunctionSigSpecializationParamKind::BoxToValue:
   case FunctionSigSpecializationParamKind::BoxToStack:
+  case FunctionSigSpecializationParamKind::ExistentialSpecialized:
     print(Node->getChild(Idx++));
     return Idx;
   case FunctionSigSpecializationParamKind::ConstantPropFunction:
@@ -1241,6 +1242,9 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
       return nullptr;
     case FunctionSigSpecializationParamKind::BoxToStack:
       Printer << "Stack Promoted from Box";
+      return nullptr;
+    case FunctionSigSpecializationParamKind::ExistentialSpecialized:
+      Printer << "Existential Type Argument Converted to Protocol Constrained Generic Type Argument";
       return nullptr;
     case FunctionSigSpecializationParamKind::ConstantPropFunction:
       Printer << "Constant Propagated Function";

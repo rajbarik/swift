@@ -225,7 +225,7 @@ void addSSAPasses(SILPassPipelinePlan &P, OptimizationLevelKind OpLevel) {
   // Promote stack allocations to values.
   P.addMem2Reg();
 
-  // Run the existentail pecializer Pass.
+  // Run the existential pecializer Pass.
   P.addExistentialSpecializer();
 
   // Cleanup, which is important if the inliner has restarted the pass pipeline.

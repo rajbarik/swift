@@ -2611,8 +2611,32 @@ SILFunction *swift::lookupPrespecializedSymbol(SILModule &M,
   return Specialization;
 }
 
-/// Create a new function name for the newly generated protocol constrained generic function.
-std::string ExistentialSpecializerTransform::createExistentialSpecializedFunctionName(){
+/// Find the set of return instructions in a function.
+static void findReturnInsts(SILFunction *F,
+                            llvm::SmallPtrSet<ReturnInst *, 4> &ReturnInsts) {
+  for (auto &BB : *F) {
+    TermInst *TI = BB.getTerminator();
+    if (auto *RI = dyn_cast<ReturnInst>(TI)) {
+      ReturnInsts.insert(RI);
+    }
+  }
+}
+
+/// Create a new function name for the newly generated protocol constrained
+/// generic function.
+std::string
+ExistentialSpecializerTransform::createExistentialSpecializedFunctionName() {
+
+  auto Args = F->begin()->getFunctionArguments();
+  llvm::SmallBitVector SpecializedArgIndices;
+  SpecializedArgIndices.resize(Args.size());
+  SpecializedArgIndices.reset();
+  for (auto const &IdxIt : ExistentialArgDescriptor) {
+    int Idx = IdxIt.first;
+    SpecializedArgIndices.set(Idx);
+    Mangler.setArgumentExistentialSpecialized(Idx);
+  }
+
   SILModule &M = F->getModule();
   int UniqueID = 0;
   std::string MangledName;
@@ -2623,28 +2647,10 @@ std::string ExistentialSpecializerTransform::createExistentialSpecializedFunctio
   return MangledName;
 }
 
-/// Recursively add composite types to the generic signature requirement.
-static void recursivelyAddCompositeTypes(ProtocolCompositionType *PType, 
-                      GenericTypeParamType *GenParam,
-                      SmallVector<Requirement, 4> &Requirements) {
-  for (auto proto : PType->getMembers()) {
-    if(proto->is<ProtocolType>()) {
-      auto ProtoDecl = proto->castTo<ProtocolType>()->getDecl();
-      Requirement NewRequirement(RequirementKind::Conformance, GenParam, ProtoDecl->getDeclaredType());
-      Requirements.push_back(NewRequirement);
-    } else if(proto->is<ClassType>()) {
-      auto ClassDecl = proto->castTo<ClassType>()->getDecl();
-      Requirement NewRequirement(RequirementKind::Superclass, GenParam, ClassDecl->getDeclaredType());
-      Requirements.push_back(NewRequirement);
-    } else if (proto->is<ProtocolCompositionType>()) {
-      auto CompType = proto->castTo<ProtocolCompositionType>();
-      recursivelyAddCompositeTypes(CompType, GenParam, Requirements);
-    }
-  }
-}
-
-/// Create the signature for the newly generated protocol constrained generic function.
-CanSILFunctionType ExistentialSpecializerTransform::createExistentialSpecializedFunctionType() {
+/// Create the signature for the newly generated protocol constrained generic
+/// function.
+CanSILFunctionType
+ExistentialSpecializerTransform::createExistentialSpecializedFunctionType() {
 
   CanSILFunctionType FTy = F->getLoweredFunctionType();
   auto ExpectedFTy = F->getLoweredType().castTo<SILFunctionType>();
@@ -2658,12 +2664,9 @@ CanSILFunctionType ExistentialSpecializerTransform::createExistentialSpecialized
 
   /// If the original function is generic, then maintain the same.
   /// Does it have generic structure already ?
-  auto HasGenericSignature = FTy->getGenericSignature() != nullptr;
-  if (HasGenericSignature) {
-    auto OrigGenericSig = FTy->getGenericSignature();
-    /// First, add the old generic signature.
-    Builder.addGenericSignature(OrigGenericSig);
-  }
+  auto OrigGenericSig = FTy->getGenericSignature();
+  /// First, add the old generic signature.
+  Builder.addGenericSignature(OrigGenericSig);
 
   /// Original list of parameters
   SmallVector<SILParameterInfo, 4> params;
@@ -2672,31 +2675,21 @@ CanSILFunctionType ExistentialSpecializerTransform::createExistentialSpecialized
 
   int GPIdx = 0;
   /// Convert the protocol arguments of F to generic ones.
-  for (auto const& IdxIt: ExistentialArgDescriptor) { 
+  for (auto const &IdxIt : ExistentialArgDescriptor) {
     int Idx = IdxIt.first;
     auto &param = params[Idx];
     auto PType = param.getType();
 
-    assert(PType->is<ProtocolType>() ||
-      PType->is<ProtocolCompositionType>() /*|| PType->is<ClassType>()*/);
+    assert(PType->is<ProtocolType>() || PType->is<ProtocolCompositionType>());
     /// Generate new generic parameter.
     auto *NewGenericParam = GenericTypeParamType::get(0, GPIdx++, Ctx);
     Builder.addGenericParameter(NewGenericParam);
-    SmallVector<Requirement, 4> Requirements;
-    if (PType->is<ProtocolType>()) { 
-      auto DeclType = PType->castTo<ProtocolType>()->getDecl();
-      Requirement NewRequirement(RequirementKind::Conformance, NewGenericParam, DeclType->getDeclaredType());
-      Requirements.push_back(NewRequirement);
-    } else { 
-      auto CompType = PType->castTo<ProtocolCompositionType>();
-      recursivelyAddCompositeTypes(CompType, NewGenericParam, Requirements);
-    }
-    auto Source = GenericSignatureBuilder::FloatingRequirementSource::forAbstract();
-    for (auto &Req : Requirements) {
-      Builder.addRequirement(Req, Source, Mod);
-    }
+    Requirement NewRequirement(RequirementKind::Conformance, NewGenericParam,
+                               PType);
+    auto Source =
+        GenericSignatureBuilder::FloatingRequirementSource::forAbstract();
+    Builder.addRequirement(NewRequirement, Source, Mod);
     Arg2GenericTypeMap[Idx] = NewGenericParam;
-    Arg2RequirementsMap[Idx] = Requirements;
   }
 
   /// Compute the generic signature.
@@ -2705,7 +2698,7 @@ CanSILFunctionType ExistentialSpecializerTransform::createExistentialSpecialized
 
   /// Create a lambda for GenericParams.
   auto getCanonicalType = [&](Type t) -> CanType {
-      return t->getCanonicalType(NewGenericSig);
+    return t->getCanonicalType(NewGenericSig);
   };
 
   /// Create the complete list of parameters.
@@ -2715,10 +2708,12 @@ CanSILFunctionType ExistentialSpecializerTransform::createExistentialSpecialized
   for (auto &param : params) {
     if (Arg2GenericTypeMap[Idx]) {
       auto GenericParam = Arg2GenericTypeMap[Idx];
-      InterfaceParams.push_back( SILParameterInfo(getCanonicalType(GenericParam), param.getConvention()));
+      InterfaceParams.push_back(SILParameterInfo(getCanonicalType(GenericParam),
+                                                 param.getConvention()));
     } else {
-        auto paramIfaceTy = param.getType()->mapTypeOutOfContext();
-        InterfaceParams.push_back( SILParameterInfo(getCanonicalType(paramIfaceTy), param.getConvention()));
+      auto paramIfaceTy = param.getType()->mapTypeOutOfContext();
+      InterfaceParams.push_back(SILParameterInfo(getCanonicalType(paramIfaceTy),
+                                                 param.getConvention()));
     }
     Idx++;
   }
@@ -2736,9 +2731,9 @@ CanSILFunctionType ExistentialSpecializerTransform::createExistentialSpecialized
   if (ExpectedFTy->hasErrorResult()) {
     auto errorResult = ExpectedFTy->getErrorResult();
     auto errorIfaceTy = errorResult.getType()->mapTypeOutOfContext();
-    InterfaceErrorResult = SILResultInfo(
-        getCanonicalType(errorIfaceTy),
-          ExpectedFTy->getErrorResult().getConvention());
+    InterfaceErrorResult =
+        SILResultInfo(getCanonicalType(errorIfaceTy),
+                      ExpectedFTy->getErrorResult().getConvention());
   }
 
   /// Now add the yields.
@@ -2753,14 +2748,12 @@ CanSILFunctionType ExistentialSpecializerTransform::createExistentialSpecialized
   auto witnessMethodConformance = FTy->getWitnessMethodConformanceOrNone();
 
   /// Return the new signature.
-  return SILFunctionType::get(NewGenericSig, ExtInfo,
-                              FTy->getCoroutineKind(),
-                              FTy->getCalleeConvention(), InterfaceParams,
-                              InterfaceYields,
-                              InterfaceResults, InterfaceErrorResult,
-                              F->getModule().getASTContext(), witnessMethodConformance);
+  return SILFunctionType::get(
+      NewGenericSig, ExtInfo, FTy->getCoroutineKind(),
+      FTy->getCalleeConvention(), InterfaceParams, InterfaceYields,
+      InterfaceResults, InterfaceErrorResult, F->getModule().getASTContext(),
+      witnessMethodConformance);
 }
-
 
 /// Determine the arguments for the new function.
 /// Copy the old body from F, but add a new init_existential.
@@ -2783,17 +2776,11 @@ void ExistentialSpecializerTransform::populateSpecializedGenericFunction() {
     NewF->setUnqualifiedOwnership();
   }
 
-  // Transfer array attributes, if any.
-  for (auto &Attr : F->getSemanticsAttrs()) {
-    if (!StringRef(Attr).startswith("array."))
-      NewF->addSemanticsAttr(Attr);
-  }
-
   /// Create the entry basic block.
   SILBasicBlock *NewFBody = NewF->createBasicBlock();
 
-  /// Builder to hold new instructions. It must have a ScopeClone with a debugscope
-  /// that is inherited from the F.
+  /// Builder to hold new instructions. It must have a ScopeClone with a
+  /// debugscope that is inherited from the F.
   SILBuilder NewFBuilder(NewFBody);
   NewFBuilder.setCurrentDebugScope(DebugScope);
   SILOpenedArchetypesTracker OpenedArchetypesTrackerNewF(NewF);
@@ -2801,66 +2788,81 @@ void ExistentialSpecializerTransform::populateSpecializedGenericFunction() {
   /// Determine the location for the new init_existential_ref.
   auto InsertLoc = F->begin()->begin()->getLoc();
   llvm::SmallDenseMap<int, SILInstruction *> Arg2AllocStackMap;
+  bool MissingDestroyUse = false;
   for (auto &ArgDesc : ArgumentDescList) {
     /// For all Generic Arguments.
-    if(Arg2GenericTypeMap[ArgDesc.Index]) {
-      auto GenericParam=Arg2GenericTypeMap[ArgDesc.Index];
-      SILType GenericSILType = M.Types.getLoweredType(NewF->mapTypeIntoContext(GenericParam));
+    if (Arg2GenericTypeMap[ArgDesc.Index]) {
+      auto GenericParam = Arg2GenericTypeMap[ArgDesc.Index];
+      SILType GenericSILType =
+          M.Types.getLoweredType(NewF->mapTypeIntoContext(GenericParam));
       auto *NewArg = NewFBody->createFunctionArgument(GenericSILType);
-      NewArg->setOwnershipKind(ValueOwnershipKind(M, GenericSILType, ArgDesc.Arg->getArgumentConvention()));
+      NewArg->setOwnershipKind(ValueOwnershipKind(
+          M, GenericSILType, ArgDesc.Arg->getArgumentConvention()));
       /// Determine the Conformances.
       SmallVector<ProtocolConformanceRef, 1> NewConformances;
-      for (auto req: Arg2RequirementsMap[ArgDesc.Index]) {
-        if (req.getSecondType()->is<ProtocolType>()) {
-          auto protoType = req.getSecondType()->castTo<ProtocolType>()->getDecl();
-          if (auto conformance =  Mod->lookupConformance(NewArg->getType().getSwiftRValueType(), protoType))
-            NewConformances.push_back(conformance.getValue());
-        }
+      auto ContextTy =
+          NewF->mapTypeIntoContext(GenericParam->getCanonicalType());
+      auto OpenedArchetype = ContextTy->getAs<ArchetypeType>();
+      for (auto proto : OpenedArchetype->getConformsTo()) {
+        NewConformances.push_back(ProtocolConformanceRef(proto));
       }
-      ArrayRef<ProtocolConformanceRef> Conformances = Ctx.AllocateCopy(NewConformances);
-      auto ExistentialRepr = ArgDesc.Arg->getType().getPreferredExistentialRepresentation(M);
+      ArrayRef<ProtocolConformanceRef> Conformances =
+          Ctx.AllocateCopy(NewConformances);
+      auto ExistentialRepr =
+          ArgDesc.Arg->getType().getPreferredExistentialRepresentation(M);
       switch (ExistentialRepr) {
-        case ExistentialRepresentation::Opaque: {
-          /// Create this sequence for addr.:
-          /// bb0(%0 : $*T):
-          /// %3 = alloc_stack $someProtocol
-          /// %4 = init_existential_addr %3 : $*someProtocol, $T 
-          /// copy_addr %0 to [initialization] %4 : $*T 
-          /// destroy_addr %0 : $*T 
-          /// %7 = open_existential_addr immutable_access %3 : $*someProtocol to $*@opened("105977B0-D8EB-11E4-AC00-3C0754644993") someProtocol
-          auto *ASI = NewFBuilder.createAllocStack (InsertLoc, ArgDesc.Arg->getType());
-          Arg2AllocStackMap[ArgDesc.Index] = ASI;
-          
-          auto *EAI = NewFBuilder.createInitExistentialAddr(
-              InsertLoc, ASI, 
-              NewArg->getType().getSwiftRValueType()->getCanonicalType(), 
-              NewArg->getType(),
-              Conformances);
-          NewFBuilder.createCopyAddr(InsertLoc, NewArg, EAI, 
-                             ExistentialArgDescriptor[ArgDesc.Index].DestroyAddrUse ? IsTake_t::IsNotTake : IsTake_t::IsTake,
-                             IsInitialization_t::IsInitialization);
-          if (ExistentialArgDescriptor[ArgDesc.Index].DestroyAddrUse) {
-            NewFBuilder.createDestroyAddr(InsertLoc, NewArg);
-          }
-          BranchArgs.push_back(ASI);
-          break;
+      case ExistentialRepresentation::Opaque: {
+        /// Create this sequence for init_existential_addr.:
+        /// bb0(%0 : $*T):
+        /// %3 = alloc_stack $P
+        /// %4 = init_existential_addr %3 : $*P, $T
+        /// copy_addr %0 to [initialization] %4 : $*T
+        /// destroy_addr %0 : $*T
+        /// %7 = open_existential_addr immutable_access %3 : $*P to
+        /// $*@opened("105977B0-D8EB-11E4-AC00-3C0754644993") P
+        auto *ASI =
+            NewFBuilder.createAllocStack(InsertLoc, ArgDesc.Arg->getType());
+        Arg2AllocStackMap[ArgDesc.Index] = ASI;
+
+        auto *EAI = NewFBuilder.createInitExistentialAddr(
+            InsertLoc, ASI,
+            NewArg->getType().getSwiftRValueType()->getCanonicalType(),
+            NewArg->getType(), Conformances);
+        /// If DestroyAddr is already there, then do not use [take].
+        NewFBuilder.createCopyAddr(
+            InsertLoc, NewArg, EAI,
+            ExistentialArgDescriptor[ArgDesc.Index].DestroyAddrUse
+                ? IsTake_t::IsNotTake
+                : IsTake_t::IsTake,
+            IsInitialization_t::IsInitialization);
+        if (ExistentialArgDescriptor[ArgDesc.Index].DestroyAddrUse) {
+          NewFBuilder.createDestroyAddr(InsertLoc, NewArg);
+        } else {
+          MissingDestroyUse = true;
         }
-        case ExistentialRepresentation::Class: {
-          ///  Create an init_existential.
-          /// %5 = init_existential_ref %0 : $T : $T, $ListenerProtocol
-          auto *InitRef = NewFBuilder.createInitExistentialRef( InsertLoc, ArgDesc.Arg->getType(),
-                      NewArg->getType().getSwiftRValueType()->getCanonicalType(), NewArg, Conformances);
-          BranchArgs.push_back(InitRef);
-          break;
-        }
-        default: {
-          assert(true); 
-          break;
-        }
+        BranchArgs.push_back(ASI);
+        break;
+      }
+      case ExistentialRepresentation::Class: {
+        ///  Create an init_existential.
+        /// %5 = init_existential_ref %0 : $T : $T, $P
+        auto *InitRef = NewFBuilder.createInitExistentialRef(
+            InsertLoc, ArgDesc.Arg->getType(),
+            NewArg->getType().getSwiftRValueType()->getCanonicalType(), NewArg,
+            Conformances);
+        BranchArgs.push_back(InitRef);
+        break;
+      }
+      default: {
+        assert(true);
+        break;
+      }
       };
     } else {
-      auto NewArg = NewFBody->createFunctionArgument(ArgDesc.Arg->getType(), ArgDesc.Decl);
-      NewArg->setOwnershipKind(ValueOwnershipKind(M, ArgDesc.Arg->getType(), ArgDesc.Arg->getArgumentConvention()));
+      auto NewArg = NewFBody->createFunctionArgument(ArgDesc.Arg->getType(),
+                                                     ArgDesc.Decl);
+      NewArg->setOwnershipKind(ValueOwnershipKind(
+          M, ArgDesc.Arg->getType(), ArgDesc.Arg->getArgumentConvention()));
       BranchArgs.push_back(NewArg);
     }
   }
@@ -2875,22 +2877,37 @@ void ExistentialSpecializerTransform::populateSpecializedGenericFunction() {
   NewIt++;
   SILBasicBlock *OldEntryBB = &(*NewIt);
 
-  /// Create a fake branch instruction, which will be eliminated by the merge function below.
+  /// Create a fake branch instruction, which will be eliminated by the merge
+  /// function call below. Clean this up in the next version.
   NewFBuilder.createBranch(InsertLoc, OldEntryBB, BranchArgs);
-
   ///  Merge the first and second basic blocks since it is just a direct branch.
-  ///  This is ugly though, with same effect.
+  ///  This is ugly though, with desired effect.
   mergeBasicBlockWithSuccessor(&(*(NewF->begin())), nullptr, nullptr);
 
-  /// Walk over destroy_addr instructions and perform fixups
-  for (const auto& mapPair : Arg2AllocStackMap) {
+  /// If there is an argument with no DestroyUse, insert DeallocStack
+  /// before return Instruction.
+  llvm::SmallPtrSet<ReturnInst *, 4> ReturnInsts;
+  if (MissingDestroyUse)
+    findReturnInsts(NewF, ReturnInsts);
+
+  /// Walk over destroy_addr instructions and perform fixups.
+  for (const auto &mapPair : Arg2AllocStackMap) {
+    int ArgIndex = mapPair.first;
     auto *ASI = dyn_cast<AllocStackInst>(mapPair.second);
-    for (Operand *ASIUse : ASI->getUses()) {
-      auto *ASIUser = ASIUse->getUser();
-      SILBuilder Builder(ASIUser);
-      Builder.setInsertionPoint(&*std::next(ASIUser->getIterator()));
-      if (auto *DAI = dyn_cast<DestroyAddrInst>(ASIUser)) {
-        Builder.createDeallocStack (DAI->getLoc(), ASI);
+    if (ExistentialArgDescriptor[ArgIndex].DestroyAddrUse) {
+      for (Operand *ASIUse : ASI->getUses()) {
+        auto *ASIUser = ASIUse->getUser();
+        if (auto *DAI = dyn_cast<DestroyAddrInst>(ASIUser)) {
+          SILBuilder Builder(ASIUser);
+          Builder.setInsertionPoint(&*std::next(ASIUser->getIterator()));
+          Builder.createDeallocStack(DAI->getLoc(), ASI);
+        }
+      }
+    } else { // Need to insert DeallocStack before return.
+      for (auto *I : ReturnInsts) {
+        SILBuilder Builder(I->getParent());
+        Builder.setInsertionPoint(I);
+        Builder.createDeallocStack(ASI->getLoc(), ASI);
       }
     }
   }
@@ -2927,40 +2944,45 @@ void ExistentialSpecializerTransform::populateThunkBody() {
   llvm::SmallVector<SILValue, 8> ApplyArgs;
   llvm::DenseMap<SubstitutableType *, Type> Generic2OpenedTypeMap;
   for (auto &ArgDesc : ArgumentDescList) {
-    if(Arg2GenericTypeMap[ArgDesc.Index]) {
+    if (Arg2GenericTypeMap[ArgDesc.Index]) {
       ArchetypeType *Opened;
       SILValue OrigOperand = ThunkBody->getArgument(ArgDesc.Index);
       auto SwiftType = ArgDesc.Arg->getType().getSwiftRValueType();
-      auto OpenedType = SwiftType->openAnyExistentialType(Opened)->getCanonicalType();
+      auto OpenedType =
+          SwiftType->openAnyExistentialType(Opened)->getCanonicalType();
       auto OpenedSILType = NewF->getModule().Types.getLoweredType(OpenedType);
       SILValue archetypeValue;
-      auto ExistentialRepr = ArgDesc.Arg->getType().getPreferredExistentialRepresentation(M);
+      auto ExistentialRepr =
+          ArgDesc.Arg->getType().getPreferredExistentialRepresentation(M);
       switch (ExistentialRepr) {
-        case ExistentialRepresentation::Opaque: {
-          archetypeValue = Builder.createOpenExistentialAddr(Loc,
-                              OrigOperand,
-                              OpenedSILType,
-                              OpenedExistentialAccess::Mutable
-                            );
-          ApplyArgs.push_back(archetypeValue);
-          break;
-        }
-        case ExistentialRepresentation::Class: {
-          archetypeValue = Builder.createOpenExistentialRef(Loc,
-                              OrigOperand,
-                              OpenedSILType
-                            );
-          ApplyArgs.push_back(archetypeValue);
-          break;
-        }
-        default: {
-          assert(true); 
-          break;
-        }
+      case ExistentialRepresentation::Opaque: {
+        archetypeValue = Builder.createOpenExistentialAddr(
+            Loc, OrigOperand, OpenedSILType, OpenedExistentialAccess::Mutable);
+        ApplyArgs.push_back(archetypeValue);
+        break;
+      }
+      case ExistentialRepresentation::Class: {
+        archetypeValue =
+            Builder.createOpenExistentialRef(Loc, OrigOperand, OpenedSILType);
+        ApplyArgs.push_back(archetypeValue);
+        break;
+      }
+      default: {
+        assert(true);
+        break;
+      }
       };
       auto GenericParam = Arg2GenericTypeMap[ArgDesc.Index];
       Generic2OpenedTypeMap[GenericParam] = OpenedType;
     } else {
+      auto CallerArg = ThunkBody->getArgument(ArgDesc.Index);
+      auto SwiftType = CallerArg->getType().getSwiftRValueType();
+      if (auto *GP = SwiftType->getAs<GenericTypeParamType>()) {
+        ArchetypeType *Opened;
+        auto OpenedType =
+            SwiftType->openAnyExistentialType(Opened)->getCanonicalType();
+        Generic2OpenedTypeMap[GP] = OpenedType;
+      }
       ApplyArgs.push_back(ThunkBody->getArgument(ArgDesc.Index));
     }
   }
@@ -2970,25 +2992,16 @@ void ExistentialSpecializerTransform::populateThunkBody() {
   SILType ResultType = NewF->getConventions().getSILResultType();
   auto GenCalleeType = NewF->getLoweredFunctionType();
 
-  // Handle cases where F is already a generic function.
-  ArrayRef<Substitution> CallerSubs = F->getForwardingSubstitutions();
-
-  SmallVector<Substitution, 8> Substitutions;
+  SmallVector<Substitution, 4> Substitutions;
   auto CalleeGenericSig = GenCalleeType->getGenericSignature();
   auto SubMap = CalleeGenericSig->getSubstitutionMap(
-    [&](SubstitutableType *type) -> Type {
-          return Generic2OpenedTypeMap[type];
-    },
-    LookUpConformanceInSignature(*CalleeGenericSig));
+      [&](SubstitutableType *type) -> Type {
+        return Generic2OpenedTypeMap[type];
+      },
+      LookUpConformanceInSignature(*CalleeGenericSig));
 
-  /// Get the substitutions.
+  /// Build the new substitutions using the base method signature.
   CalleeGenericSig->getSubstitutions(SubMap, Substitutions);
-
-  /// Combine the two substitutions (original F's substitutions and now NewF).
-  Substitutions.reserve(Substitutions.size() + CallerSubs.size());
-  for(auto Sub: CallerSubs) {
-    Substitutions.push_back(Sub);
-  }
 
   /// Perform the substitutions.
   auto SubstCalleeType = GenCalleeType->substGenericArgs(M, Substitutions);
@@ -3011,14 +3024,16 @@ void ExistentialSpecializerTransform::populateThunkBody() {
         SILType::getPrimitiveObjectType(FunctionTy->getErrorResult().getType());
     auto *ErrorArg =
         ErrorBlock->createPHIArgument(Error, ValueOwnershipKind::Owned);
-    Builder.createTryApply(Loc, FRI, Substitutions, ApplyArgs, NormalBlock, ErrorBlock);
+    Builder.createTryApply(Loc, FRI, Substitutions, ApplyArgs, NormalBlock,
+                           ErrorBlock);
 
     Builder.setInsertionPoint(ErrorBlock);
     Builder.createThrow(Loc, ErrorArg);
     Builder.setInsertionPoint(NormalBlock);
   } else {
     /// Create the Apply with substitutions
-    ReturnValue = Builder.createApply(Loc, FRI, Substitutions, ApplyArgs, false);
+    ReturnValue =
+        Builder.createApply(Loc, FRI, Substitutions, ApplyArgs, false);
   }
 
   /// Set up the return results.
@@ -3031,7 +3046,8 @@ void ExistentialSpecializerTransform::populateThunkBody() {
 
 /// Strategy to specialize existentail arguments:
 /// (1) Create a protocol constrained generic function from the old function;
-/// (2) Create a thunk for the original function that invokes (1) including setting
+/// (2) Create a thunk for the original function that invokes (1) including
+/// setting
 ///     its inline strategy as always inline.
 void ExistentialSpecializerTransform::createExistentialSpecializedFunction() {
   SILModule &M = F->getModule();
@@ -3045,11 +3061,11 @@ void ExistentialSpecializerTransform::createExistentialSpecializedFunction() {
   auto NewFGenericEnv = NewFGenericSig->createGenericEnvironment();
 
   /// Step 1: Create the new protocol constrained generic function.
-  NewF = M.createFunction(
-      linkage, Name, NewFTy, NewFGenericEnv, F->getLocation(), F->isBare(),
-      F->isTransparent(), F->isSerialized(), F->getEntryCount(), F->isThunk(),
-      F->getClassSubclassScope(), F->getInlineStrategy(), F->getEffectsKind(),
-      nullptr, F->getDebugScope());
+  NewF = M.createFunction(linkage, Name, NewFTy, NewFGenericEnv,
+                          F->getLocation(), F->isBare(), F->isTransparent(),
+                          F->isSerialized(), F->getEntryCount(), F->isThunk(),
+                          F->getClassSubclassScope(), F->getInlineStrategy(),
+                          F->getEffectsKind(), nullptr, F->getDebugScope());
 
   /// Populate the body of NewF.
   populateSpecializedGenericFunction();
@@ -3059,9 +3075,6 @@ void ExistentialSpecializerTransform::createExistentialSpecializedFunction() {
 
   assert(F->getDebugScope()->Parent != NewF->getDebugScope()->Parent);
 
-  DEBUG(
-    llvm::dbgs() << "After ExistentialSpecializer Pass\n";
-    F->dump();
-    NewF->dump();
-  );
+  DEBUG(llvm::dbgs() << "After ExistentialSpecializer Pass\n"; F->dump();
+        NewF->dump(););
 }

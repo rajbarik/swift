@@ -88,6 +88,7 @@ enum class FunctionSigSpecializationParamKind : unsigned {
   ClosureProp = 5,
   BoxToValue = 6,
   BoxToStack = 7,
+  ExistentialSpecialized = 8, 
 
   // Option Set Flags use bits 6-31. This gives us 26 bits to use for option
   // flags.

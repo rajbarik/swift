@@ -326,14 +326,8 @@ class ExistentialSpecializerTransform {
   /// Argument to Generic Type Map for NewF.
   llvm::SmallDenseMap<int, GenericTypeParamType *> Arg2GenericTypeMap;
 
-  /// Argument to Requirements Map for NewF.
-  llvm::SmallDenseMap<int, SmallVector<Requirement, 4>> Arg2RequirementsMap;
-
   // Allocate the argument descriptors.
   llvm::SmallVector<ArgumentDescriptor, 4> &ArgumentDescList;
-
-  /// List of argument indices to specialize
-  //llvm::SmallBitVector OpenedExistentialArgIndices;
 
   /// Create the Devirtualized Inner Function.
   void createExistentialSpecializedFunction();

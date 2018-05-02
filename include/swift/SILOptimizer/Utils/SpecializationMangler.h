@@ -121,6 +121,7 @@ class FunctionSignatureSpecializationMangler : public SpecializationMangler {
     ClosureProp=2,
     BoxToValue=3,
     BoxToStack=4,
+    ExistentialSpecialized=5,
     First_Option=0, Last_Option=31,
 
     // Option Set Space. 12 bits (i.e. 12 option).
@@ -152,6 +153,7 @@ public:
   void setArgumentSROA(unsigned OrigArgIdx);
   void setArgumentBoxToValue(unsigned OrigArgIdx);
   void setArgumentBoxToStack(unsigned OrigArgIdx);
+  void setArgumentExistentialSpecialized(unsigned OrigArgIdx);
   void setReturnValueOwnedToUnowned();
 
   std::string mangle(int UniqueID = 0);
