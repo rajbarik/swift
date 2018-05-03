@@ -2626,14 +2626,9 @@ static void findReturnInsts(SILFunction *F,
 /// generic function.
 std::string
 ExistentialSpecializerTransform::createExistentialSpecializedFunctionName() {
-
   auto Args = F->begin()->getFunctionArguments();
-  llvm::SmallBitVector SpecializedArgIndices;
-  SpecializedArgIndices.resize(Args.size());
-  SpecializedArgIndices.reset();
   for (auto const &IdxIt : ExistentialArgDescriptor) {
     int Idx = IdxIt.first;
-    SpecializedArgIndices.set(Idx);
     Mangler.setArgumentExistentialSpecialized(Idx);
   }
 
@@ -3075,6 +3070,9 @@ void ExistentialSpecializerTransform::createExistentialSpecializedFunction() {
 
   assert(F->getDebugScope()->Parent != NewF->getDebugScope()->Parent);
 
-  DEBUG(llvm::dbgs() << "After ExistentialSpecializer Pass\n"; F->dump();
-        NewF->dump(););
+  DEBUG(
+    llvm::dbgs() << "After ExistentialSpecializer Pass\n"; 
+    F->dump();
+    NewF->dump();
+  );
 }

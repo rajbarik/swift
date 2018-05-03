@@ -653,8 +653,10 @@ protected:
 };
 
 /// Find init_existential from global_addr, if any.
-SILValue findInitExistentialFromGlobalAddr(GlobalAddrInst *GAI, 
-                  SILInstruction *Consumer);
+SILValue findInitExistentialFromGlobalAddrAndCopyAddr(GlobalAddrInst *GAI,
+                                                  CopyAddrInst *CAI);
+SILValue findInitExistentialFromGlobalAddrAndApply(GlobalAddrInst *GAI,
+                                                  ApplySite AI, int ArgIdx);
 
 /// Returns the address of an object with which the stack location \p ASI is
 /// initialized. This is either a init_existential_addr or the destination of a

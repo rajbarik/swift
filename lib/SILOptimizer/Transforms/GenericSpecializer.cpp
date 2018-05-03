@@ -171,19 +171,8 @@ bool GenericSpecializer::specializeAppliesInFunction(SILFunction &F) {
   return Changed;
 }
 
-static bool findConcreteTypeFromIEInst(SILInstruction *Arg,
-                                       CanType &ConcreteType) {
-  if (auto *IER = dyn_cast<InitExistentialRefInst>(Arg)) {
-    ConcreteType = IER->getFormalConcreteType();
-    return true;
-  } else if (auto *IE = dyn_cast<InitExistentialAddrInst>(Arg)) {
-    ConcreteType = IE->getFormalConcreteType();
-    return true;
-  }
-  return false;
-}
-
-static bool findConcreteTypeFromIEVal(SILValue Arg, CanType &ConcreteType) {
+/// Find ConcreteType from InitExistential.
+static bool findConcreteTypeFromIE(SILValue Arg, CanType &ConcreteType) {
   if (auto *IER = dyn_cast<InitExistentialRefInst>(Arg)) {
     ConcreteType = IER->getFormalConcreteType();
     return true;
@@ -195,7 +184,7 @@ static bool findConcreteTypeFromIEVal(SILValue Arg, CanType &ConcreteType) {
 }
 
 /// Find the concrete type of the existential argument.
-static bool findConcreteType(ApplySite AI, SILValue Arg,
+static bool findConcreteType(ApplySite AI, SILValue Arg, int ArgIdx, 
                              CanType &ConcreteType) {
   bool isCopied = false;
 
@@ -208,9 +197,9 @@ static bool findConcreteType(ApplySite AI, SILValue Arg,
   /// Return init_existential if the Arg is global_addr.
   if (auto *GAI = dyn_cast<GlobalAddrInst>(Arg)) {
     SILValue InitExistential =
-        findInitExistentialFromGlobalAddr(GAI, AI.getInstruction());
+        findInitExistentialFromGlobalAddrAndApply(GAI, AI, ArgIdx);
     /// If the Arg is already init_existential, return the concrete type.
-    if (findConcreteTypeFromIEVal(InitExistential, ConcreteType)) {
+    if (findConcreteTypeFromIE(InitExistential, ConcreteType)) {
       return true;
     }
   }
@@ -225,8 +214,9 @@ static bool findConcreteType(ApplySite AI, SILValue Arg,
     }
   }
 
-  /// If the Arg is already init_existential, return the concrete type.
-  if (findConcreteTypeFromIEVal(Arg, ConcreteType)) {
+  /// If the Arg is already init_existential after getAddressofStackInit 
+  /// call, return the concrete type.
+  if (findConcreteTypeFromIE(Arg, ConcreteType)) {
     return true;
   }
 
@@ -239,13 +229,20 @@ static bool findConcreteType(ApplySite AI, SILValue Arg,
   SILInstruction *InitExistential = findInitExistential(
       FAS, OrigArg, OpenedArchetype, OpenedArchetypeDef, isCopied);
   if (!InitExistential) {
-    DEBUG(llvm::dbgs() << "Bail!...Did not find InitExistential\n";);
+    DEBUG(llvm::dbgs() << "ExistentialSpecializer Pass: Bail! Due to "
+                          "findInitExistential\n";);
     return false;
   }
 
-  /// Return the concrete type from init_existential.
-  if (findConcreteTypeFromIEInst(InitExistential, ConcreteType))
+  /// Return the concrete type from init_existential returned from
+  /// findInitExistential.
+  if (auto *IER = dyn_cast<InitExistentialRefInst>(InitExistential)) {
+    ConcreteType = IER->getFormalConcreteType();
     return true;
+  } else if (auto *IE = dyn_cast<InitExistentialAddrInst>(InitExistential)) {
+    ConcreteType = IE->getFormalConcreteType();
+    return true;
+  }
 
   return false;
 }
@@ -307,20 +304,16 @@ bool ExistentialSpecializer::canSpecializeExistentialArgsInFunction(
     ExistentialTransformArgumentDescriptor ETAD;
     ETAD.AccessType = OpenedExistentialAccess::Immutable;
     ETAD.DestroyAddrUse = false;
+    int ApplyArgIdx = PAI ? Idx - Num + minPartialAppliedArgs : Idx;
     auto ApplyArg =
-        Apply.getArgument(PAI ? Idx - Num + minPartialAppliedArgs : Idx);
-    if (!findConcreteType(Apply, ApplyArg, ConcreteType)) {
+        Apply.getArgument(ApplyArgIdx);
+    if (!findConcreteType(Apply, ApplyArg, ApplyArgIdx, ConcreteType)) {
       DEBUG(llvm::dbgs()
-                << "Bail!...did not find concrete type for callee:"
+                << "ExistentialSpecializer Pass: Bail! Due to findConcreteType "
+                   "for callee:"
                 << F->getName() << " in caller:"
                 << Apply.getInstruction()->getParent()->getParent()->getName()
                 << "\n";);
-      DEBUG({
-        llvm::dbgs() << "Caller:\n";
-        Apply.getInstruction()->getParent()->getParent()->dump();
-        llvm::dbgs() << "Callee:\n";
-        F->dump();
-      });
       continue;
     }
 
@@ -331,20 +324,16 @@ bool ExistentialSpecializer::canSpecializeExistentialArgsInFunction(
              F->getModule())) != ExistentialRepresentation::Class) &&
         (!(findIfCalleeUsesArgInWitnessMethod(Arg, ETAD)))) {
       DEBUG(llvm::dbgs()
-                << "Bail!...no witness method or destroy use found in callee:"
-                << Apply.getInstruction()->getParent()->getParent()->getName()
+                << "ExistentialSpecializer Pass: Bail! Due to failed "
+                   "findIfCalleeUsesArgInWitnessMethod in callee:"
+                << F->getName()
                 << "\n";);
-      DEBUG({
-        llvm::dbgs() << "Caller:\n";
-        Apply.getInstruction()->getParent()->getParent()->dump();
-        llvm::dbgs() << "Callee:\n";
-        F->dump();
-      });
       continue;
     }
     /// Save the protocol declaration.
     ExistentialArgDescriptor[Idx] = ETAD;
-    DEBUG(llvm::dbgs() << "Function: " << F->getName() << " Arg:" << Idx
+    DEBUG(llvm::dbgs() << "ExistentialSpecializer Pass:Function: "
+                       << F->getName() << " Arg:" << Idx
                        << "has a concrete type.\n");
     returnFlag |= true;
   }
@@ -355,8 +344,9 @@ bool ExistentialSpecializer::canSpecializeExistentialArgsInFunction(
 bool ExistentialSpecializer::canSpecializeCalleeFunction(ApplySite &Apply) {
 
   /// Disallow generic callees.
-  if (Apply.hasSubstitutions())
+  if (Apply.hasSubstitutions()) {
     return false;
+  }
 
   /// Determine the caller of the apply.
   auto *Callee = Apply.getReferencedFunction();
@@ -402,8 +392,12 @@ void ExistentialSpecializer::specializeExistentialArgsInAppliesWithinFunction(
         continue;
 
       /// Can the callee be specialized?
-      if (!canSpecializeCalleeFunction(Apply))
+      if (!canSpecializeCalleeFunction(Apply)) {
+        DEBUG(llvm::dbgs() << "ExistentialSpecializer Pass: Bail! Due to "
+                              "canSpecializeCalleeFunction.\n";
+              I->dump(););
         continue;
+      }
 
       auto *Callee = Apply.getReferencedFunction();
 
@@ -412,13 +406,14 @@ void ExistentialSpecializer::specializeExistentialArgsInAppliesWithinFunction(
           ExistentialArgDescriptor;
       if (!canSpecializeExistentialArgsInFunction(Apply,
                                                   ExistentialArgDescriptor)) {
-        DEBUG(
-            llvm::dbgs() << "  cannot specialize existential args in function: "
-                         << Callee->getName() << " -> abort\n");
+        DEBUG(llvm::dbgs()
+              << "ExistentialSpecializer Pass: Bail! Due to "
+                 "canSpecializeExistentialArgsInFunction in function: "
+              << Callee->getName() << " -> abort\n");
         continue;
       }
 
-      DEBUG(llvm::dbgs() << "Function::" << Callee->getName()
+      DEBUG(llvm::dbgs() << "ExistentialSpecializer Pass: Function::" << Callee->getName()
                          << " has an existential argument and can be optimized "
                             "via ExistentialSpecializer\n");
 
@@ -435,7 +430,7 @@ void ExistentialSpecializer::specializeExistentialArgsInAppliesWithinFunction(
       }
 
       /// This is the function to optimize for existential specilizer.
-      DEBUG(llvm::dbgs() << "*** ExistentialSpecializer Pass on function: "
+      DEBUG(llvm::dbgs() << "*** Running ExistentialSpecializer Pass on function: "
                          << Callee->getName() << " ***\n");
 
       /// Instantiate the ExistentialSpecializerTransform pass.
